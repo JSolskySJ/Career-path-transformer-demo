@@ -87,6 +87,8 @@ async function loadStatus() {
       spaceSel.appendChild(opt);
     }
   }
+  // Default the embedding-space view to BERT4Rec when available.
+  if (state.modelsLoaded.includes('bert4rec')) spaceSel.value = 'bert4rec';
 }
 
 /* ── Samples ────────────────────────────────────────────────────────────── */
