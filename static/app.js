@@ -596,6 +596,10 @@ async function drawSankeyNow() {
   const busiest = Math.max(...Object.values(maxLayerCount), 1);
   const height = Math.max(560, busiest * 26);
 
+  // Keep the rendered nodes so the click handler can map a clicked node index
+  // back to its title.
+  state.sankeyNodes = data.nodes;
+
   Plotly.react('sankey-plot', [{
     type: 'sankey',
     orientation: 'h',
@@ -605,25 +609,45 @@ async function drawSankeyNow() {
       color: nodeColors,
       pad: 14, thickness: 16,
       line: { color: '#fff', width: 0.5 },
-      hovertemplate: '%{customdata}<br>%{value} in/out<extra></extra>',
+      hovertemplate: '%{customdata}<br>%{value:.0f} flow<br><i>click to drill in</i><extra></extra>',
     },
     link: {
       source: data.links.map(l => l.source),
       target: data.links.map(l => l.target),
       value:  data.links.map(l => l.value),
       color:  linkColors,
-      hovertemplate: '%{source.label} → %{target.label}<br>%{value} transitions<extra></extra>',
+      hovertemplate: '%{source.label} → %{target.label}<br>%{value:.0f} flow<extra></extra>',
     },
   }], {
     margin: { t: 10, r: 10, b: 10, l: 10 },
     height,
     font: { size: 11 },
-  }, { responsive: true, displaylogo: false });
+  }, { responsive: true, displaylogo: false }).then(bindSankeyClick);
 
   const note = $('#flow-note');
   note.textContent = `${data.nodes.length} nodes · ${data.links.length} links`
     + ` · top-${data.top_k} · depth ${data.depth}`
     + (data.truncated ? ' · truncated for size' : '');
+}
+
+// Click a job-title node to drill into its flow: it's toggled as a starting
+// title (added as a new stem, or removed if already selected), then redrawn.
+// Bound once — the handler lives on the graph div and survives Plotly.react.
+function bindSankeyClick() {
+  if (state.sankeyClickBound) return;
+  const gd = document.getElementById('sankey-plot');
+  if (!gd || !gd.on) return;
+  gd.on('plotly_click', (ev) => {
+    const pt = ev.points && ev.points[0];
+    if (!pt) return;
+    // Links carry source & target node refs; nodes don't — ignore link clicks.
+    if (pt.source !== undefined && pt.target !== undefined) return;
+    const idx = (pt.pointNumber !== undefined) ? pt.pointNumber : pt.index;
+    const node = state.sankeyNodes[idx];
+    if (!node || node.is_other) return;   // Other has no single title to drill
+    toggleTitle(node.title);
+  });
+  state.sankeyClickBound = true;
 }
 
 function hexA(hex, a) {

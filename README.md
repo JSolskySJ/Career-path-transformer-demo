@@ -46,6 +46,14 @@ career sequences, not model output — independent of item2vec/BERT4Rec).
   named destination into the next layer. Each (title, layer) is its own node,
   so looping careers (A→B→A) stay a clean left-to-right flow. Very wide/deep
   requests are capped for browser performance and flagged as "truncated".
+- **Flow is conserved across layers**: each stem starts with its real outgoing
+  volume, and every node forwards the flow it *received*, split by that title's
+  empirical transition probabilities. So a deeper node's size is proportional
+  to the share of the starting cohort that actually reaches it — the cohort
+  fragments fast and the Other buckets swell, which is the whole point: it
+  visualises why predicting the next title is hard.
+- **Click any title node to drill in** — it's toggled as a starting title
+  (added as a new stem, or removed if already selected) and the flow redraws.
 
 Built from `artifacts/transitions.json` (see Setup).
 

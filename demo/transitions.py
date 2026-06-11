@@ -81,12 +81,21 @@ class TransitionStore:
                 })
             return node_index[key]
 
-        links = {}   # (src_idx, tgt_idx) -> value
+        links = {}     # (src_idx, tgt_idx) -> value
+        inflow = {}    # node_idx -> flow arriving at this node
 
+        # Each selected stem starts with a budget equal to its real outgoing
+        # volume, so the layer-0 links are exact transition counts.
         current = list(selected)
         for s in current:
-            node(0, s)
+            inflow[node(0, s)] = self.source_freq.get(s, 0)
 
+        # Flow is conserved layer to layer: every node forwards the flow it
+        # *received* (its inflow), split across destinations by that title's
+        # empirical transition probabilities count(s→to)/total(s). So a deeper
+        # node's size is proportional to the share of the starting cohort that
+        # actually reaches it — which is the point: the cohort fragments fast,
+        # and the growing Other buckets show why the next step is hard to call.
         for layer in range(max(1, depth)):
             if not current:
                 break
@@ -97,19 +106,24 @@ class TransitionStore:
 
             for s in current:
                 trans = self.transitions.get(s, {})
-                if not trans:
-                    continue
+                total = self.source_freq.get(s, 0)
                 src_idx = node(layer, s)
-                other_total = 0
+                budget = inflow.get(src_idx, 0)
+                if not trans or total <= 0 or budget <= 0:
+                    continue
+                other_total = 0.0
                 for to, cnt in trans.items():
+                    share = budget * cnt / total
                     if to in named:
                         tgt = node(layer + 1, to)
-                        links[(src_idx, tgt)] = links.get((src_idx, tgt), 0) + cnt
+                        links[(src_idx, tgt)] = links.get((src_idx, tgt), 0) + share
+                        inflow[tgt] = inflow.get(tgt, 0) + share
                     else:
-                        other_total += cnt
-                if other_total:
+                        other_total += share
+                if other_total > 0:
                     oidx = node(layer + 1, s, is_other=True, other_of=s)
                     links[(src_idx, oidx)] = links.get((src_idx, oidx), 0) + other_total
+                    inflow[oidx] = inflow.get(oidx, 0) + other_total
 
             # Next layer's sources = the named targets, most active first, capped.
             ranked = sorted(named, key=lambda t: -self.source_freq.get(t, 0))
@@ -118,11 +132,15 @@ class TransitionStore:
                 truncated = True
             current = ranked
 
-        link_items = sorted(links.items(), key=lambda kv: -kv[1])
+        # Drop sub-unit micro-flows (they round to 0 and only add clutter), then
+        # cap to the largest links.
+        link_items = [(k, v) for k, v in links.items() if v >= 0.5]
+        link_items.sort(key=lambda kv: -kv[1])
         if len(link_items) > MAX_LINKS:
             link_items = link_items[:MAX_LINKS]
             truncated = True
-        link_list = [{'source': s, 'target': t, 'value': v} for (s, t), v in link_items]
+        link_list = [{'source': s, 'target': t, 'value': round(v, 2)}
+                     for (s, t), v in link_items]
 
         return {
             'nodes': nodes,
