@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Career Path Transformer — Demo</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/static/style.css">
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+</head>
+<body>
+
+<header>
+  <h1>Career Path Transformer <span class="sub">item2vec &amp; BERT4Rec demo</span></h1>
+  <div class="header-right">
+    <nav class="view-switch">
+      <button class="view-btn active" data-view="predict">Predict</button>
+      <button class="view-btn" data-view="flow">Job title flow</button>
+    </nav>
+    <div id="model-status"></div>
+  </div>
+</header>
+
+<main id="view-predict">
+  <!-- ── Left: resume input ─────────────────────────────────────────── -->
+  <section class="panel" id="input-panel">
+    <div class="tabs">
+      <button class="tab active" data-tab="samples">Sample resumes</button>
+      <button class="tab" data-tab="builder">Build a resume</button>
+    </div>
+
+    <div class="tab-body" id="tab-samples">
+      <div class="row">
+        <select id="sample-category">
+          <option value="">All categories</option>
+          <option value="mixed">Mixed (education + work)</option>
+          <option value="work_only">Work only</option>
+          <option value="education_only">Education only</option>
+        </select>
+        <input id="sample-search" type="text" placeholder="Search samples…">
+      </div>
+      <div id="sample-list" class="sample-list"></div>
+    </div>
+
+    <div class="tab-body hidden" id="tab-builder">
+      <p class="hint">Entries are fed to the model in order (oldest first).
+         Fields autocomplete from the model vocabulary — out-of-vocabulary
+         values are allowed but ignored by the models.</p>
+      <div id="builder-entries"></div>
+      <div class="row">
+        <button id="add-education" class="ghost">+ Education</button>
+        <button id="add-work" class="ghost">+ Work experience</button>
+      </div>
+    </div>
+
+    <div id="resume-view"></div>
+
+    <details id="token-preview-box">
+      <summary>Model input tokens</summary>
+      <div id="token-preview"></div>
+    </details>
+
+    <div class="row controls">
+      <label>Top-K <input id="top-k" type="number" min="1" max="50" value="10"></label>
+      <button id="predict-btn" class="primary" disabled>Predict next role</button>
+    </div>
+  </section>
+
+  <!-- ── Right: results ─────────────────────────────────────────────── -->
+  <section class="panel" id="results-panel">
+    <h2>Predictions</h2>
+    <div id="sense-check"></div>
+    <div id="predictions" class="predictions-grid">
+      <p class="hint">Select or build a resume, then hit <b>Predict next role</b>.</p>
+    </div>
+
+    <h2>Embedding space</h2>
+    <div class="row plot-controls">
+      <label>Model
+        <select id="space-model"></select>
+      </label>
+      <label>View
+        <select id="space-mode">
+          <option value="global" selected>Global — whole title space (fixed axes)</option>
+          <option value="local">Local — context neighbourhood</option>
+        </select>
+      </label>
+      <span id="space-info" class="hint"></span>
+    </div>
+    <h3 class="plot-title">Resume tokens</h3>
+    <div id="space-plot"></div>
+    <h3 class="plot-title">Query &amp; predicted next titles</h3>
+    <div id="space-plot-results"></div>
+    <p class="hint">2-D PCA projections of the model's embedding vectors, on
+       the same fixed axes per model (your zoom/pan is kept between
+       predictions). Labelled squares are the most common job titles — the
+       same reference frame in both graphs. Top: the resume's experiences —
+       each point is one experience (its tokens averaged into a single vector,
+       e.g. title + role + industry) traced in career order against nearby
+       titles. Bottom: the model's query vector (★) and the top-K predicted
+       next titles (diamonds).</p>
+  </section>
+</main>
+
+<!-- ── Job title flow (Sankey) ──────────────────────────────────────── -->
+<main id="view-flow" class="hidden">
+  <section class="panel" id="flow-controls">
+    <h2>Job titles</h2>
+    <p class="hint">Pick one or more starting titles to see where careers flow
+       next. Each title's top transitions are shown; the rest are binned into
+       its own <b>Other</b>. A target is drawn explicitly whenever <em>any</em>
+       selected title has it in its top transitions — so shared destinations
+       line up, revealing overlap.</p>
+
+    <div id="flow-selected" class="chips"></div>
+
+    <input id="title-search" type="text" placeholder="Search job titles…">
+    <div id="title-list" class="title-list"></div>
+
+    <div class="slider-row">
+      <label>Top-K transitions <output id="topk-val">10</output></label>
+      <input id="topk-slider" type="range" min="3" max="20" value="10">
+    </div>
+    <div class="slider-row">
+      <label>Depth <output id="depth-val">1</output></label>
+      <input id="depth-slider" type="range" min="1" max="5" value="1">
+    </div>
+    <p id="flow-note" class="hint"></p>
+  </section>
+
+  <section class="panel" id="flow-panel">
+    <h2>Title flow</h2>
+    <div id="sankey-plot"></div>
+    <p class="hint" id="sankey-empty">Select job titles on the left to draw the
+       transition flow. Node colour marks the starting (selected) titles and
+       their downstream paths; grey <b>Other</b> nodes bin the long tail of
+       less-common transitions for each source.</p>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

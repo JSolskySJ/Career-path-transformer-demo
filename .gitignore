@@ -1,0 +1,7 @@
+# Model artifacts and generated data — large / machine-local
+artifacts/
+
+__pycache__/
+*.pyc
+.DS_Store
+.ipynb_checkpoints/
