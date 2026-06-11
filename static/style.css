@@ -235,6 +235,20 @@ button.icon { padding: 4px 8px; font-size: 12px; }
 .pred-row .score { width: 52px; text-align: right; font: 11.5px ui-monospace, Menlo, monospace; color: var(--muted); }
 .pred-card .warn { color: #b3261e; font-size: 12.5px; }
 
+/* Confidence widget — how decisive the ranking is for this resume */
+.conf { margin: 2px 0 8px; }
+.conf-head { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
+.conf-head b { text-transform: capitalize; }
+.conf .conf-meta { color: var(--muted); font: 11px ui-monospace, Menlo, monospace; }
+.conf-bar-wrap { height: 6px; background: #eef2f7; border-radius: 4px; margin-top: 3px; }
+.conf-bar { display: block; height: 6px; border-radius: 4px; }
+.conf.hi  .conf-bar { background: #059669; }   /* focused / sure */
+.conf.mid .conf-bar { background: #d97706; }
+.conf.lo  .conf-bar { background: #dc2626; }   /* very unsure */
+.conf.hi  .conf-head b { color: #059669; }
+.conf.mid .conf-head b { color: #b45309; }
+.conf.lo  .conf-head b { color: #b3261e; }
+
 /* Reserved space for up to two sense-check banners (one per model) so they
    can appear/clear without moving anything below */
 #sense-check { margin-bottom: 8px; min-height: 86px; }

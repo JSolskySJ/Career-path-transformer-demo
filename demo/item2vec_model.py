@@ -11,6 +11,7 @@ import numpy as np
 from demo import config
 from demo.tokens import W_TITLE_PREFIX, ALL_PREFIXES
 from demo.ranking_domain import ranking_domain
+from demo.confidence import distribution_confidence
 
 
 class Item2VecModel:
@@ -79,8 +80,10 @@ class Item2VecModel:
     def rank_titles(self, context: list, top_k: int = 10) -> dict:
         vec, used, unknown = self.context_vector(context)
         if vec is None:
-            return {'predictions': [], 'used_tokens': [], 'unknown_tokens': unknown}
+            return {'predictions': [], 'used_tokens': [], 'unknown_tokens': unknown,
+                    'confidence': None}
         scores = self.title_matrix @ vec
         order  = np.argsort(-scores)[:top_k]
         preds  = [{'token': self.title_vocab[i], 'score': float(scores[i])} for i in order]
-        return {'predictions': preds, 'used_tokens': used, 'unknown_tokens': unknown}
+        return {'predictions': preds, 'used_tokens': used, 'unknown_tokens': unknown,
+                'confidence': distribution_confidence(scores, 'cosine')}

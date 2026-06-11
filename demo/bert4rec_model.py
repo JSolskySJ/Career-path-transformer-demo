@@ -22,6 +22,7 @@ import torch.nn as nn
 from demo import config
 from demo.tokens import W_TITLE_PREFIX, ALL_PREFIXES
 from demo.ranking_domain import ranking_domain
+from demo.confidence import distribution_confidence
 
 PAD_TOKEN  = '[PAD]'
 MASK_TOKEN = '[MASK]'
@@ -180,7 +181,8 @@ class Bert4RecModel:
         known   = [t for t in context if t in self.vocab.str2idx]
         unknown = [t for t in context if t not in self.vocab.str2idx]
         if not known:
-            return {'predictions': [], 'used_tokens': [], 'unknown_tokens': unknown}
+            return {'predictions': [], 'used_tokens': [], 'unknown_tokens': unknown,
+                    'confidence': None}
         used = known[-(self._max_len - 1):]
         ids  = self.vocab.encode(used)
         seq  = [self.vocab.pad_id] * (self._max_len - 1 - len(ids)) + ids + [self.vocab.mask_id]
@@ -194,4 +196,7 @@ class Bert4RecModel:
 
         order = np.argsort(-probs)[:top_k]
         preds = [{'token': self.vocab.idx2str[i], 'score': float(probs[i])} for i in order]
-        return {'predictions': preds, 'used_tokens': used, 'unknown_tokens': unknown}
+        # Confidence over the title domain only (probs already sum to 1 there).
+        title_probs = probs[self._title_ids.numpy()]
+        return {'predictions': preds, 'used_tokens': used, 'unknown_tokens': unknown,
+                'confidence': distribution_confidence(title_probs, 'prob')}

@@ -311,6 +311,7 @@ function renderPredictions() {
     }
     const scoreLabel = name === 'item2vec' ? 'cosine' : 'probability';
     let html = `<h3>${name} <span class="hint">(${scoreLabel})</span></h3>`;
+    html += confidenceHtml(r.confidence);
     const max = Math.max(...r.predictions.map(p => p.score), 1e-9);
     r.predictions.forEach((p, i) => {
       const title = p.token.replace('W_TITLE:', '');
@@ -342,6 +343,34 @@ function renderPredictions() {
       sense.appendChild(div);
     }
   }
+}
+
+// Confidence summary: how decisive the model's ranking is for this resume.
+// High entropy / tiny margin = the model is spreading probability thinly and is
+// effectively guessing (the BERT4Rec story).
+function confidenceHtml(c) {
+  if (!c) return '';
+  const ent = c.entropy;                 // 0 = certain, 1 = uniform
+  const certainty = 1 - ent;             // flip so the bar reads "how sure"
+  const label = ent >= 0.9 ? 'very unsure' : ent >= 0.75 ? 'unsure'
+              : ent >= 0.5 ? 'moderate' : 'focused';
+  const cls = ent >= 0.75 ? 'lo' : ent >= 0.5 ? 'mid' : 'hi';
+  let top1, margin;
+  if (c.unit === 'prob') {
+    top1 = `top-1 ${(c.top1 * 100).toFixed(1)}%`;
+    margin = c.margin != null ? `margin ${(c.margin * 100).toFixed(1)} pp` : '';
+  } else {
+    top1 = `top-1 cos ${c.top1.toFixed(2)}`;
+    margin = c.margin != null ? `margin ${c.margin.toFixed(2)}` : '';
+  }
+  return `
+    <div class="conf ${cls}" title="Normalised entropy of the model's score distribution over ${c.n} rankable titles. Higher = probability spread thinly across many titles (less sure).">
+      <div class="conf-head">
+        <span>confidence: <b>${label}</b></span>
+        <span class="conf-meta">${top1} · ${margin} · spread ${(ent * 100).toFixed(0)}%</span>
+      </div>
+      <div class="conf-bar-wrap"><span class="conf-bar" style="width:${Math.max(2, certainty * 100).toFixed(0)}%"></span></div>
+    </div>`;
 }
 
 /* ── Embedding space plot ───────────────────────────────────────────────── */
