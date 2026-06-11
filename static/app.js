@@ -89,6 +89,11 @@ async function loadStatus() {
   }
   // Default the embedding-space view to BERT4Rec when available.
   if (state.modelsLoaded.includes('bert4rec')) spaceSel.value = 'bert4rec';
+  // Remember how many titles each model ranks over (taxonomy domain).
+  state.titleCounts = {};
+  for (const [name, info] of Object.entries(data.models)) {
+    if (info.loaded) state.titleCounts[name] = info.title_count;
+  }
 }
 
 /* ── Samples ────────────────────────────────────────────────────────────── */
@@ -335,10 +340,11 @@ function renderPredictions() {
     if (target && r.target_rank !== undefined) {
       const div = document.createElement('div');
       const rank = r.target_rank;
+      const n = state.titleCounts ? state.titleCounts[name] : null;
       const cls = rank === null ? 'bad' : rank <= 10 ? 'good' : rank <= 100 ? 'mid' : 'bad';
       const msg = rank === null
-        ? 'not rankable (outside title vocabulary)'
-        : `ranked <b>#${rank}</b> of ${''}all titles`;
+        ? 'not a taxonomy title (not ranked)'
+        : `ranked <b>#${rank}</b> of ${n ? n.toLocaleString() + ' ' : ''}taxonomy titles`;
       div.className = 'sense ' + cls;
       div.innerHTML = `<b>${name}</b> — actual next role
         “${target.replace('W_TITLE:', '')}” ${msg}`;

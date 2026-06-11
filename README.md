@@ -127,11 +127,16 @@ weights are the production weights.
 
 ### Ranking domain
 
-`artifacts/vocab.csv` carries an `in_ranking_domain` flag. Production ranks the
-next title over only the **SJ-recommendable** titles (464 of the 4,070 trained
-title tokens), not the full vocabulary — both demo models apply this via
-`demo/ranking_domain.py`. The full vocabulary is still used for the resume
-builder's autocomplete and the embedding-space background.
+Both demo models rank the next title over the **taxonomy L3 SuperTitles only**
+(the `is_taxonomy_l3` titles in `artifacts/vocab.csv` — 247 of the 4,070 trained
+title tokens); all other titles are hidden from the predictions and the
+embedding-space background. This is applied via `demo/ranking_domain.py`. Set
+`CPT_RANKING_DOMAIN_COL=in_ranking_domain` to rank over the broader SJ domain
+(464 titles) instead, or remove `vocab.csv` to rank the full vocabulary. The
+full vocabulary is always available for the resume builder's autocomplete.
+
+(The sample picker likewise only shows resumes whose held-out next title is a
+taxonomy title — see step 2 above.)
 
 `scripts/train_item2vec.py` / `train_bert4rec.py` remain for training
 demo-quality models locally when no MLflow artifacts are staged.

@@ -1,12 +1,13 @@
-"""The SJ ranking domain — the set of W_TITLE tokens a model is allowed to rank.
+"""The ranking domain — the set of W_TITLE tokens a model is allowed to rank.
 
-Production restricts next-title ranking to the SwipeJobs-recommendable titles
-(the `in_ranking_domain` column of the exported vocab CSV), not the full trained
-title vocabulary. Both demo models apply the same restriction so their live
-output matches the production predictions CSVs.
+For this demo we rank over the taxonomy L3 SuperTitles only (the
+`is_taxonomy_l3` column of the exported vocab CSV): every prediction is a clean
+taxonomy title, and all other titles are hidden. If that column is missing we
+fall back to the SwipeJobs ranking domain (`in_ranking_domain`), and if there's
+no vocab CSV at all the models rank over their entire title vocabulary.
 
-Returns None when no vocab CSV is staged, in which case the models fall back to
-ranking over their entire title vocabulary (the demo's original behaviour).
+The chosen column is configurable via CPT_RANKING_DOMAIN_COL (default
+`is_taxonomy_l3`).
 """
 
 import os
@@ -14,6 +15,8 @@ import os
 from demo import config
 
 _CACHE = {}
+_PREFERRED_COL = os.environ.get('CPT_RANKING_DOMAIN_COL', 'is_taxonomy_l3')
+_FALLBACK_COLS = ['in_ranking_domain']
 
 
 def ranking_domain():
@@ -27,7 +30,9 @@ def _load():
         return None
     import pandas as pd
     df = pd.read_csv(config.VOCAB_CSV)
-    if 'in_ranking_domain' not in df.columns:
-        return None
-    domain = set(df.loc[df['in_ranking_domain'] == True, 'token'])
-    return domain or None
+    for col in [_PREFERRED_COL, *_FALLBACK_COLS]:
+        if col in df.columns:
+            domain = set(df.loc[df[col] == True, 'token'])
+            if domain:
+                return domain
+    return None
