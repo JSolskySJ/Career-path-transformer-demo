@@ -72,7 +72,9 @@ Built from `artifacts/transitions.json` (see Setup).
 #    them (copies the item2vec .bin + vocab.csv, converts bert4rec model.pth):
 conda run -n dwh-ai-py311 python scripts/import_mlflow_artifacts.py
 
-# 2. Sample resumes for the picker (from that run's predictions CSV)
+# 2. Sample resumes for the picker (from that run's predictions CSV). By
+#    default only resumes whose held-out next title is a taxonomy L3 title
+#    (is_taxonomy_l3 in vocab.csv) are kept; pass --all-targets to disable.
 conda run -n dwh-ai-py311 python scripts/prepare_samples.py \
   --csv incoming/career_path_transformer_20260611_035118.csv --n 300
 

@@ -48,11 +48,24 @@ def label_for(tokens: list) -> str:
     return f'{head}  ({n_work} work, {n_edu} edu)'
 
 
+def taxonomy_titles():
+    """W_TITLE tokens flagged is_taxonomy_l3 in the vocab CSV (the L3
+    SuperTitles), or None if no vocab CSV is staged."""
+    if not os.path.exists(config.VOCAB_CSV):
+        return None
+    v = pd.read_csv(config.VOCAB_CSV)
+    if 'is_taxonomy_l3' not in v.columns:
+        return None
+    return set(v.loc[v['is_taxonomy_l3'] == True, 'token'])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--csv', default=None, help='eval CSV (default: newest in model_eval_csv)')
     parser.add_argument('--n', type=int, default=300)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--all-targets', action='store_true',
+                        help='do not restrict to taxonomy (is_taxonomy_l3) next titles')
     args = parser.parse_args()
 
     csv_path = args.csv or newest_eval_csv()
@@ -60,6 +73,16 @@ def main():
     df = pd.read_csv(csv_path, usecols=['context_tokens', 'correct_target'])
     df = df.drop_duplicates(subset='context_tokens')
     print(f'{len(df):,} unique held-out pairs')
+
+    # Only show resumes whose next (held-out) title is a taxonomy L3 title.
+    if not args.all_targets:
+        tax = taxonomy_titles()
+        if tax is None:
+            print('  (no vocab CSV with is_taxonomy_l3 — keeping all targets)')
+        else:
+            before = len(df)
+            df = df[df['correct_target'].isin(tax)]
+            print(f'  taxonomy filter: {len(df):,}/{before:,} pairs have a taxonomy next title')
 
     rng = np.random.default_rng(args.seed)
     idx = rng.choice(len(df), size=min(args.n, len(df)), replace=False)
