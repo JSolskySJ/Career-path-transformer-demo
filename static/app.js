@@ -15,6 +15,8 @@ const state = {
   flowLoaded: false,
   topK: 10,
   depth: 1,
+  sankeyNodes: [],
+  hoveredNode: null,
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -632,20 +634,53 @@ async function drawSankeyNow() {
 
 // Click a job-title node to drill into its flow: it's toggled as a starting
 // title (added as a new stem, or removed if already selected), then redrawn.
-// Bound once — the handler lives on the graph div and survives Plotly.react.
+//
+// Plotly Sankey swallows real `click` events on its nodes (it preventDefaults
+// the mousedown for node dragging, so the browser never synthesises a click) —
+// verified with a headless browser. But plotly_hover fires reliably, and raw
+// pointerdown/pointerup still reach the div. So: remember which node is hovered
+// at pointerdown, and on pointerup treat it as a click if the pointer didn't
+// move (a small drag tolerance keeps node dragging usable). Bound once — the
+// handlers live on the graph div and survive Plotly.react().
 function bindSankeyClick() {
   if (state.sankeyClickBound) return;
   const gd = document.getElementById('sankey-plot');
   if (!gd || !gd.on) return;
-  gd.on('plotly_click', (ev) => {
-    const pt = ev.points && ev.points[0];
-    if (!pt) return;
-    // Links carry source & target node refs; nodes don't — ignore link clicks.
-    if (pt.source !== undefined && pt.target !== undefined) return;
+
+  const nodeFromPoint = (pt) => {
+    if (!pt) return null;
+    // Link hovers carry source & target node objects; nodes don't.
+    if (pt.source !== undefined && pt.target !== undefined) return null;
+    const nodes = state.sankeyNodes || [];
     const idx = (pt.pointNumber !== undefined) ? pt.pointNumber : pt.index;
-    const node = state.sankeyNodes[idx];
-    if (!node || node.is_other) return;   // Other has no single title to drill
-    toggleTitle(node.title);
+    let node = (idx !== undefined) ? nodes[idx] : null;
+    // Fallback: match by label (titles repeat across layers but map to the
+    // same token, which is all toggleTitle needs).
+    if ((!node || node.label !== pt.label) && pt.label && pt.label !== 'Other') {
+      node = nodes.find(n => !n.is_other && n.label === pt.label) || node;
+    }
+    return (node && !node.is_other) ? node : null;   // Other isn't drillable
+  };
+
+  gd.on('plotly_hover', (ev) => {
+    state.hoveredNode = nodeFromPoint(ev.points && ev.points[0]);
+    gd.style.cursor = state.hoveredNode ? 'pointer' : '';
+  });
+  gd.on('plotly_unhover', () => {
+    state.hoveredNode = null;
+    gd.style.cursor = '';
+  });
+
+  let down = null;   // {x, y, node} captured at pointerdown
+  gd.addEventListener('pointerdown', (e) => {
+    down = { x: e.clientX, y: e.clientY, node: state.hoveredNode };
+  });
+  gd.addEventListener('pointerup', (e) => {
+    if (!down || !down.node) { down = null; return; }
+    const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y);
+    const node = down.node;
+    down = null;
+    if (moved <= 4) toggleTitle(node.title);   // a click, not a drag
   });
   state.sankeyClickBound = true;
 }
