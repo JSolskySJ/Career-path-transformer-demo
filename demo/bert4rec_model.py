@@ -21,6 +21,7 @@ import torch.nn as nn
 
 from demo import config
 from demo.tokens import W_TITLE_PREFIX, ALL_PREFIXES
+from demo.ranking_domain import ranking_domain
 
 PAD_TOKEN  = '[PAD]'
 MASK_TOKEN = '[MASK]'
@@ -101,7 +102,14 @@ class Bert4RecModel:
         self.model.load_state_dict(state)
         self.model.eval()
 
-        self.title_vocab = [t for t in self.vocab.idx2str if t.startswith(W_TITLE_PREFIX)]
+        # Rank over the SJ ranking domain when available (matches production),
+        # else all trained title tokens.
+        domain = ranking_domain()
+        all_titles = [t for t in self.vocab.idx2str if t.startswith(W_TITLE_PREFIX)]
+        self.full_title_count = len(all_titles)
+        self.restricted = domain is not None
+        self.title_vocab = ([t for t in all_titles if t in domain]
+                            if domain is not None else all_titles)
         self._title_ids  = torch.tensor([self.vocab.str2idx[t] for t in self.title_vocab])
         with torch.no_grad():
             vecs = self.model.item_emb.weight[self._title_ids].numpy().copy()

@@ -78,14 +78,14 @@ def status():
         info[name] = {
             'loaded': True,
             'vocab_size': m.vocab_size,
-            'title_count': len(m.title_vocab),
+            'title_count': len(m.title_vocab),          # rankable titles
+            'full_title_count': getattr(m, 'full_title_count', len(m.title_vocab)),
+            'ranking_restricted': getattr(m, 'restricted', False),
             'vector_size': m.vector_size,
         }
         if name == 'bert4rec':
-            info[name]['training'] = {
-                k: m.params.get(k) for k in
-                ('source_csv', 'n_sequences', 'epochs_run', 'best_loss')
-            }
+            info[name]['source'] = m.params.get('source', 'local')
+            info[name]['origin'] = m.params.get('origin', 'local')
         if name == 'item2vec':
             info[name]['source'] = os.path.basename(m.bin_path)
     for name, err in MODEL_ERRORS.items():

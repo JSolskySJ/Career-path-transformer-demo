@@ -1,5 +1,6 @@
 # Model artifacts and generated data — large / machine-local
 artifacts/
+incoming/
 
 __pycache__/
 *.pyc

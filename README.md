@@ -68,40 +68,71 @@ Built from `artifacts/transitions.json` (see Setup).
 ## Setup
 
 ```bash
-# 1. Sample resumes for the picker (from the newest eval CSV)
-conda run -n dwh-ai-py311 python scripts/prepare_samples.py --n 300
+# 1. Stage the model run's artifacts from MLflow into incoming/, then import
+#    them (copies the item2vec .bin + vocab.csv, converts bert4rec model.pth):
+conda run -n dwh-ai-py311 python scripts/import_mlflow_artifacts.py
 
-# 2. Job-title transitions for the Sankey view. The newest CSV is engineering-
-#    heavy; a larger run gives many more titles and richer tails:
+# 2. Sample resumes for the picker (from that run's predictions CSV)
+conda run -n dwh-ai-py311 python scripts/prepare_samples.py \
+  --csv incoming/career_path_transformer_20260611_035118.csv --n 300
+
+# 3. Job-title transitions for the Sankey view. A larger run gives many more
+#    titles and richer tails:
 conda run -n dwh-ai-py311 python scripts/build_transitions.py \
   --csv ../datawarehouse-ai-analysis/career_path_transformer/model_eval_csv/career_path_transformer_predictions_20260521_053039.csv
 
-# 3. Run the app
+# 4. Run the app
 ./run.sh          # http://127.0.0.1:5050
 ```
 
 Note: every eval CSV is dominated by software/engineering careers (that's the
 evaluation set), so the flow view's title list is tech-centric.
 
+### Staging the MLflow artifacts
+
+The models and vocab come from an MLflow run (experiment 51). `mlflow` isn't on
+the CLI here, so download via the Python client (the dwh-ai-py311 env has the
+`mlflow` package; connection details come from
+`datawarehouse-configurations/sj/ai/ai.conf`, as the inference notebook uses)
+into `incoming/`:
+
+- `career_path_transformer_<ts>.bin` — item2vec gensim model
+- `career_path_transformer_vocab_<ts>.csv` — shared vocab + `in_ranking_domain`
+- `model.pth` (under `models/m-…/artifacts/data/`) — bert4rec pickled module
+- `career_path_transformer_<ts>.csv` (item2vec & bert4rec predictions)
+
+`scripts/import_mlflow_artifacts.py` then stages them into `artifacts/`.
+
 ## Model artifacts
 
-**item2vec** (the focus) — loads the real trained artifact:
-`datawarehouse-ai-analysis/career_path_transformer/career_path_transformer_20260528_074025.bin`
-by default; override with `CPT_ITEM2VEC_BIN`. The current sample resumes (from
-the 0609 eval run) align with its vocabulary: 292/300 targets are rankable and
-~0.4% of context tokens are out-of-vocabulary.
+Both models are the **real trained artifacts** from the same MLflow run, staged
+by `scripts/import_mlflow_artifacts.py`:
 
-**BERT4Rec** — the app loads a checkpoint from `artifacts/bert4rec/`
-(`model.pt` state dict + `vocab.json` + `config.json`). Two ways to get one:
+**item2vec** — `artifacts/item2vec.bin` (gensim Word2Vec). Override the path
+with `CPT_ITEM2VEC_BIN`. Verified to reproduce the run's predictions CSV exactly
+(150/150 top-1 and top-3) once ranking is restricted to the SJ domain (below).
 
-- drop in a downloaded artifact from a training run (note: inference needs the
-  vocab `idx2str`, not just the torch model — `mlflow.pytorch.log_model` alone
-  doesn't persist it);
-- or train a demo-quality one locally on the eval-CSV sequences (~16k):
-  `conda run -n dwh-ai-py311 python scripts/train_bert4rec.py --epochs 40`
+**BERT4Rec** — `artifacts/bert4rec/{model.pt, vocab.json, config.json}`,
+converted from the run's `model.pth`. `mlflow.pytorch` logs the whole pickled
+`nn.Module` under the original training module path and never persists the
+vocab, so the importer registers the demo's identical `BERT4Rec` class to
+unpickle it, extracts a plain `state_dict`, and rebuilds `idx2str` as
+`['[PAD]','[MASK]'] + vocab-CSV tokens` (the CSV is in the model's
+train-count-descending order — confirmed against the model's own predictions).
+BERT4Rec's softmax over titles is nearly flat (it's genuinely uncertain), so its
+exact top-1 ordering is sensitive to CPU/torch-version numerics; the loaded
+weights are the production weights.
 
-There is also `scripts/train_item2vec.py` to train a demo item2vec on the same
-corpus, used only as a fallback when no production `.bin` is present.
+### Ranking domain
+
+`artifacts/vocab.csv` carries an `in_ranking_domain` flag. Production ranks the
+next title over only the **SJ-recommendable** titles (464 of the 4,070 trained
+title tokens), not the full vocabulary — both demo models apply this via
+`demo/ranking_domain.py`. The full vocabulary is still used for the resume
+builder's autocomplete and the embedding-space background.
+
+`scripts/train_item2vec.py` / `train_bert4rec.py` remain for training
+demo-quality models locally when no MLflow artifacts are staged.
 
 ## Layout
 
@@ -111,6 +142,7 @@ run.sh                      launcher (conda env + OpenMP workaround)
 demo/
   config.py                 paths, env-var overrides
   tokens.py                 tokenisation mirroring build_tokens()
+  ranking_domain.py         SJ ranking-domain titles from vocab.csv
   item2vec_model.py         gensim loader + cosine ranking (last-8 mean)
   bert4rec_model.py         architecture copy + checkpoint loader + ranking
   embedding_space.py        PCA maps (local neighbourhood / global)
@@ -118,10 +150,11 @@ demo/
   samples.py                sample-resume loader
 scripts/
   data_common.py            shared eval-CSV → sequence loading
+  import_mlflow_artifacts.py  incoming/ MLflow files → artifacts/ (bin, vocab, bert4rec)
   prepare_samples.py        eval CSV → artifacts/sample_resumes.json
   build_transitions.py      eval CSV → artifacts/transitions.json
-  train_item2vec.py         eval CSV → artifacts/item2vec.bin
-  train_bert4rec.py         eval CSV → artifacts/bert4rec/{model.pt,vocab.json,config.json}
+  train_item2vec.py         eval CSV → artifacts/item2vec.bin (local fallback)
+  train_bert4rec.py         eval CSV → artifacts/bert4rec/… (local fallback)
 static/                     UI (vanilla JS + Plotly CDN)
 artifacts/                  generated, gitignored
 ```

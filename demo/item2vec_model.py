@@ -10,6 +10,7 @@ import numpy as np
 
 from demo import config
 from demo.tokens import W_TITLE_PREFIX, ALL_PREFIXES
+from demo.ranking_domain import ranking_domain
 
 
 class Item2VecModel:
@@ -20,8 +21,15 @@ class Item2VecModel:
         self._model = Word2Vec.load(self.bin_path)
         self._context_last_n = context_last_n or config.CONTEXT_LAST_N
 
-        self.title_vocab = [t for t in self._model.wv.index_to_key
-                            if t.startswith(W_TITLE_PREFIX)]
+        # Rank over the SJ ranking domain when available (matches production),
+        # else the full trained title vocabulary.
+        domain = ranking_domain()
+        all_titles = [t for t in self._model.wv.index_to_key
+                      if t.startswith(W_TITLE_PREFIX)]
+        self.full_title_count = len(all_titles)
+        self.restricted = domain is not None
+        self.title_vocab = ([t for t in all_titles if t in domain]
+                            if domain is not None else all_titles)
         vecs = np.stack([self._model.wv[t] for t in self.title_vocab])
         # L2-normalised: rows are unit vectors so dot product = cosine
         self.title_matrix = vecs / (np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-9)
