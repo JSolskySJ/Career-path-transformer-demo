@@ -57,25 +57,7 @@ def main():
 
     os.makedirs(config.ARTIFACTS_DIR, exist_ok=True)
 
-    # ── vocab CSV ────────────────────────────────────────────────────────────
-    vocab_csv = _one(inc, 'career_path_transformer_vocab_*.csv', 'vocab CSV')
-    shutil.copy(vocab_csv, config.VOCAB_CSV)
-    v = pd.read_csv(config.VOCAB_CSV)
-    idx2str = [PAD_TOKEN, MASK_TOKEN] + list(v['token'])
-    n_domain = int((v.get('in_ranking_domain') == True).sum()) if 'in_ranking_domain' in v else 0
-    print(f'vocab: {len(v):,} tokens  ({n_domain:,} in ranking domain)  -> {config.VOCAB_CSV}')
-
-    # ── item2vec .bin ─────────────────────────────────────────────────────────
-    # the .bin file (not the *_vocab_*.csv, not the predictions *.csv)
-    bins = glob.glob(os.path.join(inc, 'career_path_transformer_*.bin'))
-    if not bins:
-        raise SystemExit(f'Missing item2vec .bin in {inc}')
-    item2vec_bin = max(bins, key=os.path.getmtime)
-    dst_bin = os.path.join(config.ARTIFACTS_DIR, 'item2vec.bin')
-    shutil.copy(item2vec_bin, dst_bin)
-    print(f'item2vec: {os.path.basename(item2vec_bin)} -> {dst_bin}')
-
-    # ── bert4rec model.pth -> state_dict + vocab.json + config.json ───────────
+    # ── bert4rec model.pth (load first, to drive vocab selection) ─────────────
     import torch
     import demo.bert4rec_model as b4
 
@@ -94,9 +76,44 @@ def main():
     n_layers = len({k.split('.')[2] for k in sd if k.startswith('encoder.layers.')})
     n_heads = model.encoder.layers[0].self_attn.num_heads
 
-    if vocab_size != len(idx2str):
-        raise SystemExit(f'vocab mismatch: model {vocab_size} vs csv+specials {len(idx2str)}')
+    # ── vocab CSV ─────────────────────────────────────────────────────────────
+    # A run may bundle a vocab CSV whose token count doesn't equal the model's
+    # (the two models here come from sibling runs). Pick the one that matches the
+    # bert4rec embedding table (len + 2 specials) so idx2str decodes correctly;
+    # the runs share an identical taxonomy / ranking domain, so any matching CSV
+    # serves for both models. The vocab CSV is in train-count-descending order,
+    # matching how the training Vocab is built, so idx2str = [PAD, MASK] + tokens.
+    vocab_csvs = glob.glob(os.path.join(inc, 'career_path_transformer_vocab_*.csv'))
+    if not vocab_csvs:
+        raise SystemExit(f'Missing vocab CSV in {inc}')
+    chosen = None
+    for c in sorted(vocab_csvs, key=os.path.getmtime, reverse=True):
+        if len(pd.read_csv(c, usecols=['token'])) + 2 == vocab_size:
+            chosen = c
+            break
+    if chosen is None:
+        raise SystemExit(
+            f'No vocab CSV matches bert4rec vocab_size={vocab_size} (+2). '
+            f'Candidates: {[os.path.basename(c) for c in vocab_csvs]}')
+    shutil.copy(chosen, config.VOCAB_CSV)
+    v = pd.read_csv(config.VOCAB_CSV)
+    idx2str = [PAD_TOKEN, MASK_TOKEN] + list(v['token'])
+    n_dom = int((v.get('in_ranking_domain') == True).sum()) if 'in_ranking_domain' in v else 0
+    n_tax = int((v.get('is_taxonomy_l3') == True).sum()) if 'is_taxonomy_l3' in v else 0
+    print(f'vocab: {os.path.basename(chosen)}  {len(v):,} tokens  '
+          f'({n_tax:,} taxonomy, {n_dom:,} ranking domain)  -> {config.VOCAB_CSV}')
 
+    # ── item2vec .bin ─────────────────────────────────────────────────────────
+    # the .bin file (not the *_vocab_*.csv, not the predictions *.csv)
+    bins = glob.glob(os.path.join(inc, 'career_path_transformer_*.bin'))
+    if not bins:
+        raise SystemExit(f'Missing item2vec .bin in {inc}')
+    item2vec_bin = max(bins, key=os.path.getmtime)
+    dst_bin = os.path.join(config.ARTIFACTS_DIR, 'item2vec.bin')
+    shutil.copy(item2vec_bin, dst_bin)
+    print(f'item2vec: {os.path.basename(item2vec_bin)} -> {dst_bin}')
+
+    # ── bert4rec -> state_dict + vocab.json + config.json ─────────────────────
     out = config.BERT4REC_DIR
     os.makedirs(out, exist_ok=True)
     torch.save({k: t.cpu() for k, t in sd.items()}, os.path.join(out, 'model.pt'))
