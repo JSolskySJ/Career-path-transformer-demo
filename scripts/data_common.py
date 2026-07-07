@@ -25,7 +25,7 @@ def newest_eval_csv() -> str:
 def load_sequences(csv_path: str) -> list:
     print(f'Reading {csv_path}')
     df = pd.read_csv(csv_path, usecols=['context_tokens', 'correct_target'])
-    df = df.drop_duplicates(subset='context_tokens')
+    df = df.dropna().drop_duplicates(subset='context_tokens')
     seqs = [parse_token_string(c) + [t]
             for c, t in zip(df['context_tokens'], df['correct_target'])]
     print(f'{len(seqs):,} sequences, avg length {np.mean([len(s) for s in seqs]):.1f}')

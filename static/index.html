@@ -30,6 +30,12 @@
 
     <div class="tab-body" id="tab-samples">
       <div class="row">
+        <label class="grow">Resumes from run
+          <select id="resume-source"></select>
+        </label>
+      </div>
+      <div id="run-props"></div>
+      <div class="row">
         <select id="sample-category">
           <option value="">All categories</option>
           <option value="mixed">Mixed (education + work)</option>
@@ -47,6 +53,7 @@
          values are allowed but ignored by the models.</p>
       <div id="builder-entries"></div>
       <div class="row">
+        <button id="add-skills" class="ghost">+ Skills</button>
         <button id="add-education" class="ghost">+ Education</button>
         <button id="add-work" class="ghost">+ Work experience</button>
       </div>
@@ -61,19 +68,33 @@
 
     <div class="row controls">
       <label>Top-K <input id="top-k" type="number" min="1" max="50" value="10"></label>
+      <label title="Project the ranking onto a title subset — bert4rec renormalises
+             its softmax over the projected set, so this tests whether junk titles
+             in the full vocabulary are crowding out good recommendations">
+        Rank over
+        <select id="rank-domain">
+          <option value="all">model default</option>
+          <option value="sj">SJ titles only</option>
+          <option value="taxonomy">taxonomy titles only</option>
+        </select>
+      </label>
       <button id="predict-btn" class="primary" disabled>Predict next role</button>
     </div>
   </section>
 
   <!-- ── Right: results ─────────────────────────────────────────────── -->
   <section class="panel" id="results-panel">
-    <h2>Predictions <span class="hint">— ranked over taxonomy (L3) titles only</span></h2>
+    <h2>Predictions <span class="hint">— each selected model ranks over its own domain</span></h2>
+    <div id="model-select"></div>
     <div id="sense-check"></div>
     <div id="predictions" class="predictions-grid">
       <p class="hint">Select or build a resume, then hit <b>Predict next role</b>.</p>
     </div>
 
-    <h2>Embedding space</h2>
+    <h2>Embedding space
+      <button id="toggle-space" class="ghost toggle-btn">Hide</button>
+    </h2>
+    <div id="space-section">
     <div class="row plot-controls">
       <label>Model
         <select id="space-model"></select>
@@ -98,6 +119,7 @@
        e.g. title + role + industry) traced in career order against nearby
        titles. Bottom: the model's query vector (★) and the top-K predicted
        next titles (diamonds).</p>
+    </div>
   </section>
 </main>
 

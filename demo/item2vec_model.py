@@ -16,15 +16,16 @@ from demo.confidence import distribution_confidence
 
 class Item2VecModel:
 
-    def __init__(self, bin_path: str = None, context_last_n: int = None):
+    def __init__(self, bin_path: str = None, context_last_n: int = None,
+                 vocab_csv: str = None):
         from gensim.models import Word2Vec
         self.bin_path = bin_path or config.ITEM2VEC_BIN
         self._model = Word2Vec.load(self.bin_path)
         self._context_last_n = context_last_n or config.CONTEXT_LAST_N
 
-        # Rank over the SJ ranking domain when available (matches production),
-        # else the full trained title vocabulary.
-        domain = ranking_domain()
+        # Rank over the run's own ranking domain when available (matches
+        # production), else the full trained title vocabulary.
+        domain = ranking_domain(vocab_csv)
         all_titles = [t for t in self._model.wv.index_to_key
                       if t.startswith(W_TITLE_PREFIX)]
         self.full_title_count = len(all_titles)
@@ -77,13 +78,25 @@ class Item2VecModel:
         vec = vec / (np.linalg.norm(vec) + 1e-9)
         return vec, ctx, unknown
 
-    def rank_titles(self, context: list, top_k: int = 10) -> dict:
+    def rank_titles(self, context: list, top_k: int = 10, allowed: set = None) -> dict:
+        """Rank titles by cosine. ``allowed`` (optional set of W_TITLE tokens)
+        projects the ranking onto that subset — for cosine this is an exact
+        post-filter, no renormalisation needed."""
         vec, used, unknown = self.context_vector(context)
         if vec is None:
             return {'predictions': [], 'used_tokens': [], 'unknown_tokens': unknown,
-                    'confidence': None}
+                    'confidence': None, 'n_ranked': 0}
         scores = self.title_matrix @ vec
-        order  = np.argsort(-scores)[:top_k]
-        preds  = [{'token': self.title_vocab[i], 'score': float(scores[i])} for i in order]
+        vocab = self.title_vocab
+        if allowed is not None:
+            idx = [i for i, t in enumerate(vocab) if t in allowed]
+            vocab = [vocab[i] for i in idx]
+            scores = scores[idx]
+        if not vocab:
+            return {'predictions': [], 'used_tokens': used, 'unknown_tokens': unknown,
+                    'confidence': None, 'n_ranked': 0}
+        order = np.argsort(-scores)[:top_k]
+        preds = [{'token': vocab[i], 'score': float(scores[i])} for i in order]
         return {'predictions': preds, 'used_tokens': used, 'unknown_tokens': unknown,
-                'confidence': distribution_confidence(scores, 'cosine')}
+                'confidence': distribution_confidence(scores, 'cosine'),
+                'n_ranked': len(vocab)}

@@ -2,10 +2,10 @@
 
 The architecture is an exact copy of BERT4Rec in
 datawarehouse-ai/models/career_path_transformer_bert4rec.py so checkpoints are
-weight-compatible. Production runs log only the torch model to MLflow (the
-vocab is not logged), so the demo trains and loads its own local checkpoint:
-artifacts/bert4rec/{model.pt, vocab.json, config.json} written by
-scripts/train_bert4rec.py.
+weight-compatible. The demo loads a plain local checkpoint —
+artifacts/bert4rec/{model.pt, vocab.json, config.json} — written either by
+scripts/import_mlflow_artifacts.py (from a production run's model.pth +
+logged vocab.json) or by scripts/train_bert4rec.py (local fallback).
 
 Ranking mirrors CareerPathBERT4RecModel._rank_titles: left-pad the encoded
 context to max_len - 1, append [MASK], softmax the mask-position logits over
@@ -81,8 +81,9 @@ class Vocab:
 class Bert4RecModel:
     """Inference wrapper around a demo checkpoint directory."""
 
-    def __init__(self, artifact_dir: str = None):
+    def __init__(self, artifact_dir: str = None, vocab_csv: str = None):
         artifact_dir = artifact_dir or config.BERT4REC_DIR
+        self._vocab_csv = vocab_csv
         with open(os.path.join(artifact_dir, 'config.json')) as f:
             self.params = json.load(f)
         with open(os.path.join(artifact_dir, 'vocab.json')) as f:
@@ -103,9 +104,9 @@ class Bert4RecModel:
         self.model.load_state_dict(state)
         self.model.eval()
 
-        # Rank over the SJ ranking domain when available (matches production),
-        # else all trained title tokens.
-        domain = ranking_domain()
+        # Rank over the run's own ranking domain when available (matches
+        # production), else all trained title tokens.
+        domain = ranking_domain(vocab_csv)
         all_titles = [t for t in self.vocab.idx2str if t.startswith(W_TITLE_PREFIX)]
         self.full_title_count = len(all_titles)
         self.restricted = domain is not None
@@ -118,11 +119,11 @@ class Bert4RecModel:
         self.title_matrix = vecs / (np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-9)
 
     @classmethod
-    def load_if_available(cls, artifact_dir: str = None):
+    def load_if_available(cls, artifact_dir: str = None, vocab_csv: str = None):
         artifact_dir = artifact_dir or config.BERT4REC_DIR
         if all(os.path.exists(os.path.join(artifact_dir, f))
                for f in ('model.pt', 'vocab.json', 'config.json')):
-            return cls(artifact_dir)
+            return cls(artifact_dir, vocab_csv=vocab_csv)
         return None
 
     # ── Introspection ────────────────────────────────────────────────────────
@@ -177,26 +178,42 @@ class Bert4RecModel:
             h = self.model.encoder(h, src_key_padding_mask=(ids_t == self.vocab.pad_id))
         return h[0, -1].numpy().copy(), used, unknown
 
-    def rank_titles(self, context: list, top_k: int = 10) -> dict:
+    def rank_titles(self, context: list, top_k: int = 10, allowed: set = None) -> dict:
+        """Rank titles by [MASK] softmax. ``allowed`` (optional set of W_TITLE
+        tokens) PROJECTS the softmax onto that subset — the logits are masked
+        to the allowed titles and renormalised, a true restricted-domain
+        prediction rather than a post-hoc filter."""
         known   = [t for t in context if t in self.vocab.str2idx]
         unknown = [t for t in context if t not in self.vocab.str2idx]
         if not known:
             return {'predictions': [], 'used_tokens': [], 'unknown_tokens': unknown,
-                    'confidence': None}
+                    'confidence': None, 'n_ranked': 0}
         used = known[-(self._max_len - 1):]
         ids  = self.vocab.encode(used)
         seq  = [self.vocab.pad_id] * (self._max_len - 1 - len(ids)) + ids + [self.vocab.mask_id]
 
+        title_ids = self._title_ids
+        if allowed is not None:
+            keep = [i for i, t in zip(self._title_ids.tolist(), self.title_vocab)
+                    if t in allowed]
+            if not keep:
+                return {'predictions': [], 'used_tokens': used, 'unknown_tokens': unknown,
+                        'confidence': None, 'n_ranked': 0}
+            title_ids = torch.tensor(keep)
         title_mask = torch.zeros(self.vocab.size, dtype=torch.bool)
-        title_mask[self._title_ids] = True
+        title_mask[title_ids] = True
         with torch.no_grad():
             logits = self.model(torch.tensor(seq).unsqueeze(0))[0, -1]
             logits = logits.masked_fill(~title_mask, float('-inf'))
             probs  = torch.softmax(logits, dim=-1).numpy()
 
-        order = np.argsort(-probs)[:top_k]
+        # Order over the (possibly projected) title ids only — a full-vocab
+        # argsort would let zero-prob masked entries pad out a small domain.
+        tid = title_ids.numpy()
+        order = tid[np.argsort(-probs[tid])][:top_k]
         preds = [{'token': self.vocab.idx2str[i], 'score': float(probs[i])} for i in order]
-        # Confidence over the title domain only (probs already sum to 1 there).
-        title_probs = probs[self._title_ids.numpy()]
+        # Confidence over the (possibly projected) domain — probs sum to 1 there.
+        title_probs = probs[tid]
         return {'predictions': preds, 'used_tokens': used, 'unknown_tokens': unknown,
-                'confidence': distribution_confidence(title_probs, 'prob')}
+                'confidence': distribution_confidence(title_probs, 'prob'),
+                'n_ranked': len(title_ids)}

@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Model inspector — Career Path Transformer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/static/style.css">
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  /* Full-page inspector layout on top of the demo stylesheet */
+  main.inspector { display: block; max-width: 1500px; margin: 0 auto; padding: 14px 18px 60px; }
+  .inspector .panel { margin-bottom: 14px; }
+  .inspector h1 { font-size: 19px; margin: 0; }
+  .inspector h1 .title-token { text-transform: capitalize; }
+  .inspector h2 { font-size: 15px; margin: 18px 0 6px; }
+  .inspector h3 { font-size: 13px; margin: 12px 0 4px; color: var(--muted); }
+  .inspector .meta-row { display: flex; flex-wrap: wrap; gap: 14px; color: var(--muted); font-size: 12.5px; margin-top: 4px; }
+  .inspector #resume-tokens { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+  .inspector table.kv.lens { width: auto; }
+  .inspector table.kv.lens th { text-align: left; font-size: 11px; color: var(--muted);
+    border-bottom: 1px solid var(--line); padding: 3px 14px 3px 0; }
+  .inspector table.kv.lens td { padding: 3px 14px 3px 0; }
+  .inspector .heatmap { width: 100%; }
+  .inspector details.mask-weights { margin: 2px 0 14px; font-size: 12.5px; }
+  .inspector details.mask-weights summary { cursor: pointer; color: var(--accent); }
+  .inspector .contrib-row .tok { max-width: 420px; }
+  .inspector .contrib-row .bar-wrap { max-width: 500px; }
+  .inspector .err { color: #b91c1c; }
+</style>
+</head>
+<body>
+
+<main class="inspector">
+  <section class="panel">
+    <h1 id="head">Model inspector</h1>
+    <div class="meta-row" id="meta"></div>
+    <div id="resume-tokens"></div>
+  </section>
+  <section class="panel" id="content"><p class="hint">Loading model internals…</p></section>
+</main>
+
+<script>
+const $ = (sel) => document.querySelector(sel);
+
+// Single-hue sequential ramp (attention weight = magnitude): surface → dark blue.
+const ATTN_SCALE = [[0, '#f8fafc'], [1, '#1e40af']];
+
+function short(tok) { return tok.includes(':') ? tok.split(/:(.*)/)[1] : tok; }
+function tokType(tok) { return tok.includes(':') ? tok.split(':')[0] : tok; }
+
+function fail(msg) {
+  $('#content').innerHTML = `<p class="err">${msg}</p>`;
+}
+
+function renderHeader(payload) {
+  $('#head').innerHTML = `Why “<span class="title-token">${short(payload.title)}</span>”?
+    <span class="hint">— ${payload.label}</span>`;
+  const target = payload.target
+    ? `<span>actual next role: <b>${short(payload.target)}</b></span>` : '';
+  $('#meta').innerHTML = `<span>model run: <code>${payload.model}</code></span>${target}
+    <span>${payload.tokens.length} resume tokens</span>`;
+  $('#resume-tokens').innerHTML = payload.tokens
+    .map(t => `<span class="tok ${tokType(t)}">${t}</span>`).join('');
+}
+
+function renderItem2vec(data) {
+  const max = Math.max(...data.contributions.map(c => Math.abs(c.cosine)), 1e-9);
+  $('#content').innerHTML = `
+    <h2>Per-token pull toward the title <span class="hint">cosine of each context
+      token vs the title vector · overall ranking score ${data.score.toFixed(4)}
+      (item2vec has no layers — this is the whole computation)</span></h2>
+    ${data.contributions.map(c => `
+      <div class="contrib-row">
+        <span class="tok ${c.type}">${c.token}</span>
+        <span class="bar-wrap"><span class="bar${c.cosine < 0 ? ' neg' : ''}"
+          style="width:${Math.max(2, 100 * Math.abs(c.cosine) / max)}%"></span></span>
+        <span class="score">${c.cosine.toFixed(4)}</span>
+      </div>`).join('')}`;
+}
+
+function renderBert4rec(data) {
+  const box = $('#content');
+  const lensRows = data.layers.map(l => `
+    <tr><td>${l.name}</td>
+      <td>${l.title_logit.toFixed(3)}</td>
+      <td>${l.title_prob !== undefined ? (l.title_prob * 100).toFixed(3) + '%' : '—'}</td>
+      <td>${l.title_rank !== undefined ? '#' + l.title_rank : '—'}</td>
+      <td>${l.top_titles.map(t => `${t.title} (${(t.prob * 100).toFixed(1)}%)`).join(' · ')}</td>
+    </tr>`).join('');
+  box.innerHTML = `
+    ${data.faithful === false
+      ? '<p class="err">The instrumented re-run diverged from the encoder — treat these internals as approximate.</p>' : ''}
+    <h2>Logit lens <span class="hint">the [MASK] hidden state after each layer,
+      projected through the output head — where this title's score forms</span></h2>
+    <table class="kv lens">
+      <tr><th>after</th><th>title logit</th><th>in-domain prob</th><th>rank</th>
+          <th>top titles at this depth</th></tr>
+      ${lensRows}
+    </table>
+    <h2>Attention <span class="hint">full query × key matrices per layer and head.
+      Rows are queries, columns what they attend to; the red-outlined bottom row is
+      [MASK] — the prediction query. Values are printed when they fit; hover always
+      shows the exact weight. All panels share ONE colour/bar scale, so equal
+      colour or bar length means equal weight across every layer and head.</span></h2>
+    <div id="attn"></div>`;
+
+  const attn = $('#attn');
+  const L = data.labels.length;
+  const showValues = L <= 28;                       // printed weights when readable
+
+  // Full prefixed tokens for the axes, colour-coded like the header chips
+  // (work = blue, education = green, skills = amber, [MASK] = red).
+  const fullTokens = data.labels.map((l, i) =>
+    data.token_types[i] === 'MASK' ? '[MASK]' : `${data.token_types[i]}:${l}`);
+  const TICK_COLOR = { E: '#059669', S: '#b45309', MASK: '#dc2626' };
+  const tickColor = (i) => {
+    const t = data.token_types[i];
+    return TICK_COLOR[t === 'MASK' ? 'MASK' : t[0]] || '#2563eb';   // W_* = work blue
+  };
+  const trunc = (s) => (s.length > 34 ? s.slice(0, 32) + '…' : s);
+  const tickvals = [...fullTokens.keys()];
+  const ticktext = fullTokens.map((f, i) =>
+    `<span style="color:${tickColor(i)}">${trunc(f)}</span>`);
+  // Numeric axes + explicit tick text: keeps duplicate tokens (two identical
+  // tenures/skills) as separate positions — category axes would merge them.
+  const customdata = fullTokens.map(q => fullTokens.map(k => [q, k]));
+  const maxLabel = Math.max(...fullTokens.map(f => Math.min(f.length, 34)));
+
+  // ONE shared scale across every layer and head — per-panel auto-scaling would
+  // make the same colour/bar length mean different weights in different panels.
+  const attnMax = Math.max(1e-9, ...data.layers.filter(l => l.attention)
+    .flatMap(l => l.attention.flat(2)));
+
+  for (const layer of data.layers) {
+    if (!layer.attention) continue;
+    layer.attention.forEach((matrix, h) => {
+      const head = document.createElement('h3');
+      head.textContent = `${layer.name} · head ${h + 1}`;
+      attn.appendChild(head);
+
+      const plot = document.createElement('div');
+      plot.className = 'heatmap';
+      attn.appendChild(plot);
+      Plotly.newPlot(plot, [{
+        z: matrix, type: 'heatmap',
+        customdata,
+        colorscale: ATTN_SCALE, zmin: 0, zmax: attnMax,
+        ...(showValues ? { texttemplate: '%{z:.2f}', textfont: { size: 9 } } : {}),
+        colorbar: { thickness: 10, tickfont: { size: 9 } },
+        hovertemplate: 'query %{customdata[0]}<br>key %{customdata[1]}<br>' +
+                       'weight %{z:.4f}<extra></extra>',
+      }], {
+        margin: { l: Math.min(260, 7 * maxLabel + 50), r: 60, t: 8,
+                  b: Math.min(220, 6 * maxLabel + 60) },
+        xaxis: { tickmode: 'array', tickvals, ticktext, tickfont: { size: 9 }, tickangle: 45 },
+        yaxis: { tickmode: 'array', tickvals, ticktext, tickfont: { size: 9 },
+                 autorange: 'reversed' },
+        shapes: [{ type: 'rect', x0: -0.5, x1: L - 0.5, y0: L - 1.5, y1: L - 0.5,
+                   line: { color: '#dc2626', width: 2 } }],
+        height: Math.min(1400, Math.max(420, 20 * L + 200)),
+      }, { displayModeBar: false, responsive: true });
+
+      // Every [MASK] weight for this head, sorted — the prediction query in
+      // full. Bars are on the SAME shared scale as the heatmaps (attnMax), so
+      // they compare directly across heads and layers.
+      const maskRow = matrix[L - 1];
+      const order = [...maskRow.keys()].sort((a, b) => maskRow[b] - maskRow[a]);
+      const det = document.createElement('details');
+      det.className = 'mask-weights';
+      det.innerHTML = `<summary>[MASK] attention weights, sorted (${L} positions,
+          bars on the shared scale)</summary>
+        ${order.map(i => `
+          <div class="contrib-row">
+            <span class="tok ${data.token_types[i]}">${fullTokens[i]}</span>
+            <span class="bar-wrap"><span class="bar"
+              style="width:${Math.max(1, 100 * maskRow[i] / attnMax)}%"></span></span>
+            <span class="score">${maskRow[i].toFixed(4)}</span>
+          </div>`).join('')}`;
+      attn.appendChild(det);
+    });
+  }
+}
+
+(async function init() {
+  const key = location.hash.slice(1);
+  const payload = JSON.parse(localStorage.getItem(key) || 'null');
+  if (!payload) {
+    return fail('No inspection payload found — open this page by clicking a ' +
+                'predicted title in the demo (the payload is handed over per tab).');
+  }
+  renderHeader(payload);
+  const res = await fetch('/api/inspect', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tokens: payload.tokens, model: payload.model, title: payload.title }),
+  });
+  const data = await res.json();
+  if (data.error) return fail(data.error);
+  document.title = `${short(payload.title)} — ${payload.label} — inspector`;
+  if (data.architecture === 'item2vec') renderItem2vec(data);
+  else renderBert4rec(data);
+})();
+</script>
+</body>
+</html>

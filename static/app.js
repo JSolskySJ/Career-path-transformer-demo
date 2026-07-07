@@ -7,7 +7,10 @@ const state = {
   entrySeq: 0,
   activeTab: 'samples',
   lastPrediction: null,
-  modelsLoaded: [],
+  runs: {},               // run_id -> /api/status model entry
+  selectedModels: new Set(),   // run_ids used for prediction
+  resumeRun: null,        // run_id the sample resumes come from
+  modelsLoaded: [],       // loaded run_ids
   // job title flow (Sankey)
   view: 'predict',
   flowTitles: [],         // [{title, value, out_count, degree}]
@@ -24,30 +27,50 @@ const $ = (sel) => document.querySelector(sel);
 const FIELD_SPECS = {
   WORK: [
     ['title',    'W_TITLE',    'Job title *'],
+    ['duration', 'W_DURATION', 'Tenure bucket (e.g. 1-2y)'],
     ['role',     'W_ROLE',     'Role (e.g. engineering)'],
     ['subrole',  'W_SUBROLE',  'Sub-role (e.g. software)'],
     ['industry', 'W_INDUSTRY', 'Industry'],
+    ['company',  'W_COMPANY',  'Company'],
+    ['spec',     'W_SPEC',     'Specialisations (comma-separated)'],
   ],
   EDUCATION: [
     ['major',       'E_MAJOR',  'Major (e.g. computer science)'],
     ['degree',      'E_DEGREE', 'Degree (e.g. bachelors)'],
     ['school_type', 'E_TYPE',   'School type'],
+    ['level',       'E_LEVEL',  'Education level'],
+  ],
+  SKILLS: [
+    ['skills', 'S_SKILL', 'Skills (comma-separated, e.g. forklift, welding)'],
   ],
 };
+
+// Comma-separated multi-value fields → one token per value.
+const MULTI_FIELDS = new Set(['spec', 'skills']);
 
 /* ── Token building (mirrors demo/tokens.py) ────────────────────────────── */
 
 function norm(v) { return (v || '').trim().toLowerCase(); }
 
-function tokensFromEntries(entries) {
+function tokensFromEntry(e) {
   const out = [];
-  for (const e of entries) {
-    for (const [field, prefix] of FIELD_SPECS[e.type]) {
-      const v = norm(e.values[field]);
-      if (v) out.push(`${prefix}:${v}`);
+  for (const [field, prefix] of FIELD_SPECS[e.type]) {
+    const values = MULTI_FIELDS.has(field)
+      ? (e.values[field] || '').split(',') : [e.values[field]];
+    for (const raw of values) {
+      const v = norm(raw);
+      if (v && !out.includes(`${prefix}:${v}`)) out.push(`${prefix}:${v}`);
     }
   }
   return out;
+}
+
+function tokensFromEntries(entries) {
+  // SKILLS entries are emitted first regardless of position — training
+  // prepends the skill preamble to the sequence.
+  const skills = entries.filter(e => e.type === 'SKILLS');
+  const rest = entries.filter(e => e.type !== 'SKILLS');
+  return [...skills, ...rest].flatMap(tokensFromEntry);
 }
 
 function currentTokens() {
@@ -64,44 +87,151 @@ function currentTarget() {
 
 /* ── Status ─────────────────────────────────────────────────────────────── */
 
+// Run start date as YYYY-MM-DD ('' when unknown, e.g. locally-trained runs).
+function runDate(info) {
+  const ms = +info.start_time;
+  return ms ? new Date(ms).toISOString().slice(0, 10) : '';
+}
+
+// Newest run first everywhere — makes the most recent run obvious.
+function runsByDate() {
+  return Object.entries(state.runs)
+    .sort((a, b) => (+b[1].start_time || 0) - (+a[1].start_time || 0));
+}
+
 async function loadStatus() {
   const res = await fetch('/api/status');
   const data = await res.json();
+  state.runs = data.models;
   const box = $('#model-status');
   box.innerHTML = '';
   const spaceSel = $('#space-model');
   spaceSel.innerHTML = '';
-  for (const [name, info] of Object.entries(data.models)) {
+  state.titleCounts = {};
+  for (const [rid, info] of runsByDate()) {
     const chip = document.createElement('span');
     chip.className = 'chip' + (info.loaded ? '' : ' err');
     chip.textContent = info.loaded
-      ? `${name} · ${info.title_count.toLocaleString()} titles`
-      : `${name} unavailable`;
+      ? `${info.label} · ${info.title_count.toLocaleString()} titles`
+      : `${info.label} unavailable`;
     if (!info.loaded) chip.title = info.error;
     box.appendChild(chip);
     if (info.loaded) {
-      state.modelsLoaded.push(name);
+      state.modelsLoaded.push(rid);
+      state.selectedModels.add(rid);
+      state.titleCounts[rid] = info.title_count;
       const opt = document.createElement('option');
-      opt.value = name;
-      opt.textContent = name;
+      opt.value = rid;
+      opt.textContent = runDate(info) ? `${info.label} · ${runDate(info)}` : info.label;
       spaceSel.appendChild(opt);
     }
   }
-  // Default the embedding-space view to BERT4Rec when available.
-  if (state.modelsLoaded.includes('bert4rec')) spaceSel.value = 'bert4rec';
-  // Remember how many titles each model ranks over (taxonomy domain).
-  state.titleCounts = {};
-  for (const [name, info] of Object.entries(data.models)) {
-    if (info.loaded) state.titleCounts[name] = info.title_count;
+  // Default the embedding-space view to a BERT4Rec run when available.
+  const b4 = state.modelsLoaded.find(r => state.runs[r].architecture === 'bert4rec');
+  if (b4) spaceSel.value = b4;
+  renderModelSelect();
+}
+
+/* ── Model selection (compare model versions side by side) ─────────────── */
+
+function fmtMetric(v) {
+  return Number.isInteger(v) ? v.toLocaleString() : Number(v).toFixed(4);
+}
+
+function kvTable(obj, fmt = (v) => v) {
+  const rows = Object.entries(obj)
+    .map(([k, v]) => `<tr><td>${k}</td><td>${fmt(v)}</td></tr>`).join('');
+  return rows ? `<table class="kv">${rows}</table>` : '<p class="hint">none recorded</p>';
+}
+
+function modelInfoHtml(info) {
+  const ranking = info.loaded
+    ? `ranks over <b>${info.title_count.toLocaleString()}</b>` +
+      (info.ranking_restricted
+        ? ` of ${info.full_title_count.toLocaleString()} trained titles (ranking domain)`
+        : ' titles (full trained vocabulary)')
+    : '';
+  return `
+    <p class="hint">${info.architecture} · run <code>${info.run_id}</code>
+      ${runDate(info) ? `· trained ${runDate(info)}` : ''}
+      ${info.run_tag && info.run_tag !== 'N/A' ? `· tag <code>${info.run_tag}</code>` : ''}
+      ${ranking ? `<br>${ranking}` : ''}</p>
+    <h4>Key metrics</h4>
+    ${kvTable(info.metrics, fmtMetric)}
+    <h4>Model-side transformations</h4>
+    ${kvTable(info.transformations)}
+    <details class="all-params"><summary>All run params (${Object.keys(info.params).length})</summary>
+      ${kvTable(info.params)}</details>`;
+}
+
+function renderModelSelect() {
+  const box = $('#model-select');
+  box.innerHTML = '';
+  for (const rid of state.modelsLoaded) {
+    const info = state.runs[rid];
+    const row = document.createElement('div');
+    row.className = 'model-row';
+    const id = `model-check-${rid}`;
+    row.innerHTML = `
+      <label for="${id}">
+        <input type="checkbox" id="${id}" ${state.selectedModels.has(rid) ? 'checked' : ''}>
+        <b>${info.architecture}</b> · ${info.run_name}
+        ${runDate(info) ? `<span class="run-date">${runDate(info)}</span>` : ''}
+        ${info.metrics.test_recall_at_10 !== undefined
+          ? `<span class="hint">R@10 ${info.metrics.test_recall_at_10.toFixed(3)}</span>` : ''}
+      </label>
+      <details class="model-info"><summary>info</summary>${modelInfoHtml(info)}</details>`;
+    row.querySelector('input').onchange = (e) => {
+      e.target.checked ? state.selectedModels.add(rid) : state.selectedModels.delete(rid);
+    };
+    box.appendChild(row);
   }
 }
 
 /* ── Samples ────────────────────────────────────────────────────────────── */
 
-async function loadSamples() {
-  const res = await fetch('/api/samples');
-  state.samples = await res.json();
+async function loadSamples(runId) {
+  const res = await fetch('/api/samples' + (runId ? `?run=${encodeURIComponent(runId)}` : ''));
+  const data = await res.json();
+  state.samples = data.samples;
+  state.resumeRun = data.run;
+  state.selectedSample = null;
+  renderResumeSource();
+  renderRunProps();
   renderSampleList();
+}
+
+function renderResumeSource() {
+  const sel = $('#resume-source');
+  sel.innerHTML = '';
+  const sources = runsByDate().map(([, r]) => r).filter(r => r.has_samples);
+  for (const r of sources) {
+    const opt = document.createElement('option');
+    opt.value = r.run_id;
+    const date = runDate(r);
+    opt.textContent = `${r.label}${date ? ' · ' + date : ''} (${r.run_id.slice(0, 8)})`;
+    sel.appendChild(opt);
+  }
+  if (state.resumeRun) sel.value = state.resumeRun;
+  sel.disabled = sources.length <= 1;
+}
+
+function renderRunProps() {
+  const box = $('#run-props');
+  const info = state.runs[state.resumeRun];
+  if (!info) { box.innerHTML = ''; return; }
+  const ranking = info.loaded
+    ? (info.ranking_restricted
+        ? `ranks over <b>${info.title_count.toLocaleString()}</b> of
+           ${info.full_title_count.toLocaleString()} trained titles (ranking domain)`
+        : `ranks over its full <b>${info.title_count.toLocaleString()}</b>-title vocabulary`)
+    : '<span class="warn">model not loaded</span>';
+  const chips = Object.entries(info.transformations)
+    .map(([k, v]) => `<span class="chip-sm prop" title="${k}">${k}=${v}</span>`)
+    .join('');
+  box.innerHTML = `
+    <p class="hint">Held-out resumes from <b>${info.label}</b> — the model ${ranking}.</p>
+    <div class="chips-inline">${chips || '<span class="hint">no transformation params recorded</span>'}</div>`;
 }
 
 function renderSampleList() {
@@ -120,7 +250,9 @@ function renderSampleList() {
     const div = document.createElement('div');
     div.className = 'sample-item' +
       (state.selectedSample && state.selectedSample.id === s.id ? ' selected' : '');
-    div.innerHTML = `<span>${s.label}</span><span class="cat">${s.category.replace('_', ' ')}</span>`;
+    const nSkills = s.context_tokens.filter(t => t.startsWith('S_SKILL:')).length;
+    const skills = nSkills ? `<span class="skill-count" title="${nSkills} skills">🛠${nSkills}</span>` : '';
+    div.innerHTML = `<span>${s.label}</span><span class="tags">${skills}<span class="cat">${s.category.replace('_', ' ')}</span></span>`;
     div.onclick = () => { state.selectedSample = s; renderSampleList(); onResumeChanged(); };
     list.appendChild(div);
   }
@@ -142,7 +274,8 @@ function renderBuilder() {
     div.className = 'entry ' + entry.type.toLowerCase();
     const head = document.createElement('div');
     head.className = 'entry-head';
-    head.innerHTML = `<span class="badge">${entry.type === 'WORK' ? '💼 WORK' : '🎓 EDUCATION'} #${i + 1}</span>`;
+    const badge = { WORK: '💼 WORK', EDUCATION: '🎓 EDUCATION', SKILLS: '🛠 SKILLS' }[entry.type];
+    head.innerHTML = `<span class="badge">${badge} #${i + 1}</span>`;
     const btns = document.createElement('span');
     for (const [label, fn, enabled] of [
       ['↑', () => moveEntry(i, -1), i > 0],
@@ -198,7 +331,10 @@ function removeEntry(i) {
 let acTimer = null;
 function autocomplete(input, wrap, prefix, entry, field) {
   clearTimeout(acTimer);
-  const q = norm(input.value);
+  // Multi-value fields autocomplete the segment after the last comma.
+  const multi = MULTI_FIELDS.has(field);
+  const parts = multi ? input.value.split(',') : [input.value];
+  const q = norm(parts[parts.length - 1]);
   if (!q) { clearSuggestions(wrap); return; }
   acTimer = setTimeout(async () => {
     const res = await fetch(`/api/vocab?type=${prefix}&q=${encodeURIComponent(q)}&limit=12`);
@@ -211,8 +347,9 @@ function autocomplete(input, wrap, prefix, entry, field) {
       const item = document.createElement('div');
       item.textContent = v;
       item.onmousedown = () => {
-        entry.values[field] = v;
-        input.value = v;
+        const next = multi ? [...parts.slice(0, -1), ` ${v}`].join(',').replace(/^ /, '') : v;
+        entry.values[field] = next;
+        input.value = next;
         clearSuggestions(wrap);
         onResumeChanged(false);
       };
@@ -228,21 +365,56 @@ function clearSuggestions(wrap) {
 
 /* ── Resume display + token preview ─────────────────────────────────────── */
 
+// Repeated fields (skills, specs, double majors) arrive comma-joined.
+function splitMulti(v) {
+  return (v || '').split(',').map(s => s.trim()).filter(Boolean);
+}
+
+function chipRow(values, cls) {
+  return values.length
+    ? `<span class="chips-inline">${values.map(v => `<span class="chip-sm ${cls}">${v}</span>`).join('')}</span>`
+    : '';
+}
+
+function renderSkillsExperience(exp) {
+  // Skill preambles are long — a counter with a native dropdown.
+  const skills = splitMulti(exp.skills);
+  const el = document.createElement('details');
+  el.className = 'exp skills';
+  el.innerHTML = `
+    <summary><span class="badge">🛠</span>
+      <b>Skills</b> <span class="count">${skills.length}</span>
+      <span class="meta">candidate-level, fed to the model before the first experience</span>
+    </summary>
+    <div class="skill-list">${chipRow(skills, 'skill')}</div>`;
+  return el;
+}
+
 function renderResumeView() {
   const box = $('#resume-view');
   box.innerHTML = '';
   if (state.activeTab !== 'samples' || !state.selectedSample) return;
   for (const exp of state.selectedSample.experiences) {
+    if (exp.type === 'SKILLS') {
+      box.appendChild(renderSkillsExperience(exp));
+      continue;
+    }
     const div = document.createElement('div');
     const isWork = exp.type === 'WORK';
-    div.className = 'exp ' + (isWork ? 'work' : 'education');
+    div.className = 'exp ' + exp.type.toLowerCase();
     const main = isWork ? (exp.title || '—') : (exp.major || exp.degree || '—');
     const meta = isWork
       ? [exp.role, exp.subrole, exp.industry].filter(Boolean).join(' · ')
-      : [exp.degree, exp.school_type].filter(Boolean).join(' · ');
+      : [exp.degree, exp.school_type, exp.level].filter(Boolean).join(' · ');
+    const tenure = isWork && (exp.tenure || exp.duration)
+      ? `<span class="tenure" title="Tenure in this role">⏱ ${exp.tenure || exp.duration}</span>` : '';
+    const company = isWork && exp.company
+      ? `<span class="company" title="Company">🏢 ${exp.company}</span>` : '';
+    const specs = isWork ? chipRow(splitMulti(exp.spec), 'spec') : '';
     div.innerHTML = `
       <span class="badge">${isWork ? '💼' : '🎓'}</span>
-      <span class="body"><b>${main}</b><br><span class="meta">${meta}</span></span>`;
+      <span class="body"><b>${main}</b>${tenure}${company}<br>
+        <span class="meta">${meta}</span>${specs}</span>`;
     box.appendChild(div);
   }
   const t = document.createElement('p');
@@ -286,6 +458,8 @@ async function predict() {
         tokens,
         target: currentTarget(),
         top_k: parseInt($('#top-k').value || '10', 10),
+        models: [...state.selectedModels],
+        domain: $('#rank-domain').value,
       }),
     });
     state.lastPrediction = await res.json();
@@ -308,7 +482,8 @@ function renderPredictions() {
   const sense = $('#sense-check');
   sense.innerHTML = '';
 
-  for (const [name, r] of Object.entries(results)) {
+  for (const [rid, r] of Object.entries(results)) {
+    const name = r.label || rid;
     const card = document.createElement('div');
     card.className = 'pred-card';
     if (r.error) {
@@ -316,17 +491,20 @@ function renderPredictions() {
       box.appendChild(card);
       continue;
     }
-    const scoreLabel = name === 'item2vec' ? 'cosine' : 'probability';
-    let html = `<h3>${name} <span class="hint">(${scoreLabel})</span></h3>`;
+    const scoreLabel = r.architecture === 'item2vec' ? 'cosine' : 'probability';
+    const nRanked = r.n_ranked ? ` · ranked over ${r.n_ranked.toLocaleString()} titles` : '';
+    let html = `<h3>${name} <span class="hint">(${scoreLabel}${nRanked})</span></h3>`;
     html += confidenceHtml(r.confidence);
     const max = Math.max(...r.predictions.map(p => p.score), 1e-9);
     r.predictions.forEach((p, i) => {
       const title = p.token.replace('W_TITLE:', '');
       const hit = target && p.token === target;
+      const flags = (p.sj ? ' <span class="flag">(SJ)</span>' : '')
+                  + (p.tax ? ` <span class="flag">(${p.tax})</span>` : '');
       html += `
         <div class="pred-row${hit ? ' hit' : ''}">
           <span class="rank">${i + 1}</span>
-          <span class="title">${title}${hit ? ' ✓' : ''}</span>
+          <span class="title">${title}${flags}${hit ? ' ✓' : ''}</span>
           <span class="bar-wrap"><span class="bar" style="width:${Math.max(3, 100 * p.score / max)}%"></span></span>
           <span class="score">${p.score.toFixed(4)}</span>
         </div>`;
@@ -335,22 +513,50 @@ function renderPredictions() {
       html += `<p class="warn">Ignored ${r.unknown_tokens.length} out-of-vocabulary token(s)</p>`;
     }
     card.innerHTML = html;
+    // Drill-down: click a predicted title to open the full-page inspector
+    // (bert4rec logit lens + attention; item2vec token contributions).
+    card.querySelectorAll('.pred-row').forEach((row, i) => {
+      row.classList.add('clickable');
+      row.title = 'Click to inspect what the model is doing for this title (new tab)';
+      row.onclick = () => openInspect(rid, r.predictions[i].token);
+    });
     box.appendChild(card);
 
     if (target && r.target_rank !== undefined) {
       const div = document.createElement('div');
       const rank = r.target_rank;
-      const n = state.titleCounts ? state.titleCounts[name] : null;
+      const n = r.n_ranked || (state.titleCounts ? state.titleCounts[rid] : null);
       const cls = rank === null ? 'bad' : rank <= 10 ? 'good' : rank <= 100 ? 'mid' : 'bad';
       const msg = rank === null
-        ? 'not a taxonomy title (not ranked)'
-        : `ranked <b>#${rank}</b> of ${n ? n.toLocaleString() + ' ' : ''}taxonomy titles`;
+        ? 'not in this model\'s ranking domain (not ranked)'
+        : `ranked <b>#${rank}</b> of ${n ? n.toLocaleString() + ' ' : ''}rankable titles`;
       div.className = 'sense ' + cls;
       div.innerHTML = `<b>${name}</b> — actual next role
         “${target.replace('W_TITLE:', '')}” ${msg}`;
       sense.appendChild(div);
     }
   }
+}
+
+/* ── Title drill-down — opens the full-page inspector in a new tab ───────── */
+
+function openInspect(rid, title) {
+  // The resume token list is too long for a URL — hand the payload to the new
+  // tab via localStorage (shared across same-origin tabs), keyed by timestamp.
+  for (const k of Object.keys(localStorage)) {          // prune old payloads
+    if (k.startsWith('cpt_inspect_') && Date.now() - +k.split('_')[2] > 3600e3) {
+      localStorage.removeItem(k);
+    }
+  }
+  const key = `cpt_inspect_${Date.now()}`;
+  localStorage.setItem(key, JSON.stringify({
+    model: rid,
+    title,
+    tokens: state.lastPrediction.tokens,
+    target: state.lastPrediction.target,
+    label: (state.runs[rid] || {}).label || rid,
+  }));
+  window.open(`/inspect#${key}`, '_blank');
 }
 
 // Confidence summary: how decisive the model's ranking is for this resume.
@@ -388,9 +594,10 @@ const KIND_STYLE = {
   prediction: { color: '#d97706', size: 11, symbol: 'diamond' },
   context:    { color: '#dc2626', size: 16, symbol: 'star' },
 };
-const TYPE_COLOR = { WORK: '#2563eb', EDUCATION: '#059669' };
+const TYPE_COLOR = { WORK: '#2563eb', EDUCATION: '#059669', SKILLS: '#b45309' };
 
 async function drawSpace() {
+  if ($('#space-section').classList.contains('hidden')) return;   // hidden — skip the work
   const tokens = currentTokens();
   if (!tokens.length || !state.modelsLoaded.length) return;
   const model = $('#space-model').value || state.modelsLoaded[0];
@@ -401,6 +608,7 @@ async function drawSpace() {
     body: JSON.stringify({
       tokens, model, mode,
       top_k: parseInt($('#top-k').value || '10', 10),
+      domain: $('#rank-domain').value,
     }),
   });
   const data = await res.json();
@@ -768,11 +976,22 @@ document.querySelectorAll('.tab').forEach(tab => {
 
 $('#sample-category').onchange = renderSampleList;
 $('#sample-search').oninput = renderSampleList;
+$('#resume-source').onchange = async (e) => {
+  await loadSamples(e.target.value);
+  onResumeChanged();
+};
 $('#add-work').onclick = () => addEntry('WORK');
 $('#add-education').onclick = () => addEntry('EDUCATION');
+$('#add-skills').onclick = () => addEntry('SKILLS');
 $('#predict-btn').onclick = predict;
 $('#space-model').onchange = drawSpace;
 $('#space-mode').onchange = drawSpace;
+$('#rank-domain').onchange = () => { if (state.lastPrediction) predict(); };
+$('#toggle-space').onclick = () => {
+  const hidden = $('#space-section').classList.toggle('hidden');
+  $('#toggle-space').textContent = hidden ? 'Show' : 'Hide';
+  if (!hidden) drawSpace();   // redraw fresh — plots sized while hidden collapse
+};
 
 (async function init() {
   await loadStatus();

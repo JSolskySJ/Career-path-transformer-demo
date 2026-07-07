@@ -19,17 +19,20 @@ _PREFERRED_COL = os.environ.get('CPT_RANKING_DOMAIN_COL', 'is_taxonomy_l3')
 _FALLBACK_COLS = ['in_ranking_domain']
 
 
-def ranking_domain():
-    if 'domain' not in _CACHE:
-        _CACHE['domain'] = _load()
-    return _CACHE['domain']
+def ranking_domain(vocab_csv: str = None):
+    """Domain from the given vocab CSV (default: the legacy global one).
+    Cached per path. None when the CSV is missing or has no flag columns."""
+    path = vocab_csv or config.VOCAB_CSV
+    if path not in _CACHE:
+        _CACHE[path] = _load(path)
+    return _CACHE[path]
 
 
-def _load():
-    if not os.path.exists(config.VOCAB_CSV):
+def _load(path):
+    if not os.path.exists(path):
         return None
     import pandas as pd
-    df = pd.read_csv(config.VOCAB_CSV)
+    df = pd.read_csv(path)
     for col in [_PREFERRED_COL, *_FALLBACK_COLS]:
         if col in df.columns:
             domain = set(df.loc[df[col] == True, 'token'])
