@@ -57,12 +57,24 @@ header .sub { font-weight: 400; color: var(--muted); font-size: 14px; margin-lef
 
 main {
   display: grid;
-  grid-template-columns: 430px 1fr;
+  grid-template-columns: auto 1fr;
   gap: 16px;
   padding: 16px 22px;
   align-items: start;
 }
-@media (max-width: 1100px) { main { grid-template-columns: 1fr; } }
+/* The input card is user-resizable (native drag grip, bottom-right corner) so
+   cut-off job titles / skills can be revealed; the grid's auto column tracks it. */
+#input-panel {
+  width: 430px;
+  min-width: 320px;
+  max-width: 65vw;
+  resize: horizontal;
+  overflow: auto;
+}
+@media (max-width: 1100px) {
+  main { grid-template-columns: 1fr; }
+  #input-panel { width: auto; resize: none; }
+}
 
 .panel {
   background: var(--panel);
@@ -224,8 +236,10 @@ details.exp.skills summary .meta { color: var(--muted); font-size: 11.5px; }
 details.exp.skills .skill-list { margin: 6px 0 2px 26px; }
 
 /* Resume source (run picker) + run properties */
-.row .grow { flex: 1; display: flex; align-items: center; gap: 8px; }
-.row .grow select { flex: 1; }
+.row .grow { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; }
+/* min-width: 0 lets the select shrink below its widest option — without it the
+   long "arch · run · date (id)" options push the box outside the card. */
+.row .grow select { flex: 1; min-width: 0; }
 #run-props { margin: 4px 0 8px; }
 #run-props .hint { margin: 2px 0 5px; }
 .chip-sm.prop {
@@ -344,15 +358,17 @@ table.kv td:first-child { color: var(--muted); font-family: ui-monospace, Menlo,
 .controls { margin-top: 12px; justify-content: space-between; }
 .controls input[type=number] { width: 64px; margin-left: 6px; }
 
-/* Predictions — fixed height with internal scroll so the embedding graph
-   below never moves, whatever the predictions/warnings render */
+/* Predictions — one column per model, horizontal scrollbar at the bottom when
+   more models are selected than fit; fixed height with internal vertical
+   scroll so the embedding graph below never moves */
 .predictions-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(300px, 1fr);
   gap: 12px;
   align-content: start;
   height: 330px;
-  overflow-y: auto;
+  overflow: auto;
   border: 1px solid var(--line);
   border-radius: 9px;
   padding: 8px;

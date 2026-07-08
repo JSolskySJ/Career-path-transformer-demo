@@ -67,7 +67,8 @@
     </details>
 
     <div class="row controls">
-      <label>Top-K <input id="top-k" type="number" min="1" max="50" value="10"></label>
+      <label title="How many job titles each model predicts (default 10)">
+        Top-K <input id="top-k" type="number" min="1" max="500" value="10"></label>
       <label title="Project the ranking onto a title subset — bert4rec renormalises
              its softmax over the projected set, so this tests whether junk titles
              in the full vocabulary are crowding out good recommendations">

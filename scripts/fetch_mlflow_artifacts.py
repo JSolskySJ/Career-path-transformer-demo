@@ -213,26 +213,31 @@ def fetch_run_files(mlflow, arch, run, inc) -> dict:
             files['vocab_json'] = dst
             print(f'  vocab.json -> {os.path.basename(dst)} (authoritative idx2str)')
 
-    # The model binary lives under the run's logged model, not the run root.
+    # The model binary lives under the run's logged model (older runs) OR
+    # directly under the run's own artifact tree (newer runs log the model as a
+    # run artifact, not a separate logged-model entity — search_logged_models
+    # returns nothing for those). Try the logged model first, fall back to the
+    # run root.
+    from mlflow.store.artifact.artifact_repository_registry import get_artifact_repository
     models = mlflow.search_logged_models(experiment_ids=[run.info.experiment_id],
                                          filter_string=f"source_run_id='{rid}'",
                                          output_format='list')
     named = [m for m in models if m.name == arch] or models
-    if not named:
-        print(f'  WARNING: no logged model on run {rid} — model binary skipped')
-        return files
-    model_id = named[0].model_id
     # Download ONLY the model binary — the logged model dir also holds large
     # files the demo doesn't need (python_model.pkl, env specs), and pulling
     # everything makes the fetch slow and flaky. For item2vec that's the .bin
     # PLUS any gensim .npy sidecars (large models store vectors separately as
     # <name>.bin.wv.vectors.npy etc.).
-    from mlflow.store.artifact.artifact_repository_registry import get_artifact_repository
-    repo = get_artifact_repository(mlflow.get_logged_model(model_id).artifact_location)
     pattern = '*.bin*' if arch == 'item2vec' else '*.pth'
+    if named:
+        source = f'logged model {named[0].model_id}'
+        repo = get_artifact_repository(mlflow.get_logged_model(named[0].model_id).artifact_location)
+    else:
+        source = 'run artifacts'
+        repo = get_artifact_repository(run.info.artifact_uri)
     paths = _find_artifacts(repo, pattern)
     if not paths:
-        print(f'  WARNING: no {pattern} in logged model {model_id}')
+        print(f'  WARNING: no {pattern} in {source} for run {rid} — model binary skipped')
         return files
     tmp = os.path.join(inc, f'_model_{arch}')
     os.makedirs(tmp, exist_ok=True)
@@ -246,7 +251,7 @@ def fetch_run_files(mlflow, arch, run, inc) -> dict:
         shutil.move(local, dst)
         if dst.endswith(('.bin', '.pth')):
             files['model_file'] = dst
-        print(f'  {base}  (logged model {model_id})')
+        print(f'  {base}  ({source})')
     shutil.rmtree(tmp, ignore_errors=True)
     return files
 
