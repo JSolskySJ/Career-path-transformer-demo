@@ -16,7 +16,6 @@
       <button class="view-btn active" data-view="predict">Predict</button>
       <button class="view-btn" data-view="flow">Job title flow</button>
     </nav>
-    <div id="model-status"></div>
   </div>
 </header>
 
@@ -33,6 +32,11 @@
         <label class="grow">Resumes from run
           <select id="resume-source"></select>
         </label>
+        <button id="build-samples" class="ghost"
+                title="Rebuild this run's held-out resumes straight from its dataset
+                parquet, using the training repo's own tokenisation + deterministic
+                split. Slow (reads the full dataset from S3) — only needed when a
+                new dataset is generated.">⟳ Build from dataset</button>
       </div>
       <div id="run-props"></div>
       <div class="row">
@@ -87,7 +91,6 @@
   <section class="panel" id="results-panel">
     <h2>Predictions <span class="hint">— each selected model ranks over its own domain</span></h2>
     <div id="model-select"></div>
-    <div id="sense-check"></div>
     <div id="predictions" class="predictions-grid">
       <p class="hint">Select or build a resume, then hit <b>Predict next role</b>.</p>
     </div>

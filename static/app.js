@@ -9,6 +9,8 @@ const state = {
   lastPrediction: null,
   runs: {},               // run_id -> /api/status model entry
   selectedModels: new Set(),   // run_ids used for prediction
+  // model-list date filter — default: only runs trained in the last 14 days
+  modelDateCutoff: new Date(Date.now() - 14 * 864e5).toISOString().slice(0, 10),
   resumeRun: null,        // run_id the sample resumes come from
   modelsLoaded: [],       // loaded run_ids
   // job title flow (Sankey)
@@ -103,29 +105,25 @@ async function loadStatus() {
   const res = await fetch('/api/status');
   const data = await res.json();
   state.runs = data.models;
-  const box = $('#model-status');
-  box.innerHTML = '';
   const spaceSel = $('#space-model');
   spaceSel.innerHTML = '';
   state.titleCounts = {};
+  const defaultPerArch = new Set();   // newest loaded run per architecture
   for (const [rid, info] of runsByDate()) {
-    const chip = document.createElement('span');
-    chip.className = 'chip' + (info.loaded ? '' : ' err');
-    chip.textContent = info.loaded
-      ? `${info.label} · ${info.title_count.toLocaleString()} titles`
-      : `${info.label} unavailable`;
-    if (!info.loaded) chip.title = info.error;
-    box.appendChild(chip);
     if (info.loaded) {
       state.modelsLoaded.push(rid);
-      state.selectedModels.add(rid);
       state.titleCounts[rid] = info.title_count;
+      if (![...defaultPerArch].some(r => state.runs[r].architecture === info.architecture)) {
+        defaultPerArch.add(rid);
+      }
       const opt = document.createElement('option');
       opt.value = rid;
       opt.textContent = runDate(info) ? `${info.label} · ${runDate(info)}` : info.label;
       spaceSel.appendChild(opt);
     }
   }
+  // Sensible default with many staged versions: the newest run per architecture.
+  state.selectedModels = defaultPerArch;
   // Default the embedding-space view to a BERT4Rec run when available.
   const b4 = state.modelsLoaded.find(r => state.runs[r].architecture === 'bert4rec');
   if (b4) spaceSel.value = b4;
@@ -164,28 +162,101 @@ function modelInfoHtml(info) {
       ${kvTable(info.params)}</details>`;
 }
 
-function renderModelSelect() {
+// Curated param order for the comparison table — the ones that tell runs
+// apart; any other params that DIFFER across runs are appended automatically.
+const COMPARE_METRICS = ['test_recall_at_10', 'test_recall_at_5', 'test_recall_at_1', 'test_mrr'];
+const COMPARE_HIDDEN = new Set(['run_tag']);   // noise (usually N/A)
+
+function compareTableHtml(rids) {
+  const runs = rids.map(r => state.runs[r]);
+  const header = runs.map(r =>
+    `<th title="${r.run_id}">${r.run_name}<br><span class="hint">${r.architecture}${runDate(r) ? ' · ' + runDate(r) : ''}${r.loaded ? '' : ' · unavailable'}</span></th>`).join('');
+  const paramKeys = [...new Set(runs.flatMap(r => Object.keys(r.params)))]
+    .filter(k => !COMPARE_HIDDEN.has(k)).sort();
+  const row = (label, values, cls = '') => {
+    const differs = new Set(values.map(v => String(v ?? '—'))).size > 1;
+    return `<tr class="${cls}${differs ? ' diff' : ''}"><td>${label}</td>${
+      values.map(v => `<td>${v ?? '—'}</td>`).join('')}</tr>`;
+  };
+  const metricRows = COMPARE_METRICS.map(k =>
+    row(k, runs.map(r => r.metrics[k] !== undefined ? r.metrics[k].toFixed(4) : null), 'metric'));
+  const paramRows = paramKeys.map(k => row(k, runs.map(r => r.params[k])));
+  return `<div class="compare-wrap"><table class="kv compare">
+    <tr><th></th>${header}</tr>${metricRows.join('')}${paramRows.join('')}
+  </table></div>
+  <p class="hint">Highlighted rows differ between runs — that's what tells the models apart.</p>`;
+}
+
+function modelSummaryText() {
+  const n = state.selectedModels.size;
+  const names = [...state.selectedModels].map(r => state.runs[r].run_name).join(', ');
+  return n ? `Models — ${n} selected: ${names}` : 'Models — none selected';
+}
+
+function renderModelSelect(keepOpen = false) {
   const box = $('#model-select');
   box.innerHTML = '';
-  for (const rid of state.modelsLoaded) {
-    const info = state.runs[rid];
+  const dd = document.createElement('details');
+  dd.className = 'dropdown';
+  dd.open = keepOpen;
+  dd.innerHTML = `<summary>${modelSummaryText()}</summary><div class="dropdown-body"></div>`;
+  const body = dd.querySelector('.dropdown-body');
+
+  // Date filter — hide runs trained before the cutoff (selected runs and
+  // undated legacy checkpoints always stay visible).
+  const cutoffMs = state.modelDateCutoff ? Date.parse(state.modelDateCutoff) : 0;
+  const all = runsByDate();
+  const ordered = all.filter(([rid, i]) =>
+    state.selectedModels.has(rid) || !cutoffMs || !+i.start_time || +i.start_time >= cutoffMs);
+  const nHidden = all.length - ordered.length;
+  const filter = document.createElement('div');
+  filter.className = 'row model-filter';
+  filter.innerHTML = `
+    <label>Trained after
+      <input type="date" id="model-date-filter" value="${state.modelDateCutoff || ''}">
+    </label>
+    <span class="hint">${nHidden ? `${nHidden} older run${nHidden > 1 ? 's' : ''} hidden — clear the date to show all` : 'showing all runs'}</span>`;
+  filter.querySelector('input').onchange = (e) => {
+    state.modelDateCutoff = e.target.value;
+    renderModelSelect(true);
+  };
+  body.appendChild(filter);
+
+  for (const [rid, info] of ordered.filter(([, i]) => i.loaded)
+      .concat(ordered.filter(([, i]) => !i.loaded))) {
     const row = document.createElement('div');
-    row.className = 'model-row';
+    row.className = 'model-row' + (info.loaded ? '' : ' unavailable');
     const id = `model-check-${rid}`;
     row.innerHTML = `
       <label for="${id}">
-        <input type="checkbox" id="${id}" ${state.selectedModels.has(rid) ? 'checked' : ''}>
+        <input type="checkbox" id="${id}" ${info.loaded ? '' : 'disabled'}
+               ${state.selectedModels.has(rid) ? 'checked' : ''}>
         <b>${info.architecture}</b> · ${info.run_name}
         ${runDate(info) ? `<span class="run-date">${runDate(info)}</span>` : ''}
         ${info.metrics.test_recall_at_10 !== undefined
           ? `<span class="hint">R@10 ${info.metrics.test_recall_at_10.toFixed(3)}</span>` : ''}
+        ${info.loaded ? '' : `<span class="warn" title="${info.error || ''}">unavailable — ${info.error || 'no model'}</span>`}
       </label>
       <details class="model-info"><summary>info</summary>${modelInfoHtml(info)}</details>`;
     row.querySelector('input').onchange = (e) => {
       e.target.checked ? state.selectedModels.add(rid) : state.selectedModels.delete(rid);
+      dd.querySelector('summary').textContent = modelSummaryText();
     };
-    box.appendChild(row);
+    body.appendChild(row);
   }
+
+  // Full parameter comparison across every staged run (params from MLflow).
+  const cmp = document.createElement('details');
+  cmp.className = 'compare-params';
+  cmp.innerHTML = '<summary>Compare run parameters</summary>';
+  cmp.addEventListener('toggle', () => {
+    if (cmp.open && !cmp.dataset.built) {
+      cmp.insertAdjacentHTML('beforeend', compareTableHtml(ordered.map(([rid]) => rid)));
+      cmp.dataset.built = '1';
+    }
+  });
+  body.appendChild(cmp);
+  box.appendChild(dd);
 }
 
 /* ── Samples ────────────────────────────────────────────────────────────── */
@@ -204,16 +275,54 @@ async function loadSamples(runId) {
 function renderResumeSource() {
   const sel = $('#resume-source');
   sel.innerHTML = '';
-  const sources = runsByDate().map(([, r]) => r).filter(r => r.has_samples);
+  // Every run is selectable — ones without staged resumes are marked, and the
+  // "Build from dataset" button can create theirs.
+  const sources = runsByDate().map(([, r]) => r)
+    .sort((a, b) => (b.has_samples ? 1 : 0) - (a.has_samples ? 1 : 0));
   for (const r of sources) {
     const opt = document.createElement('option');
     opt.value = r.run_id;
     const date = runDate(r);
-    opt.textContent = `${r.label}${date ? ' · ' + date : ''} (${r.run_id.slice(0, 8)})`;
+    opt.textContent = `${r.label}${date ? ' · ' + date : ''} (${r.run_id.slice(0, 8)})`
+      + (r.has_samples ? '' : ' — no resumes');
     sel.appendChild(opt);
   }
   if (state.resumeRun) sel.value = state.resumeRun;
-  sel.disabled = sources.length <= 1;
+}
+
+async function buildSamples() {
+  const btn = $('#build-samples');
+  const rid = $('#resume-source').value;
+  if (!rid) return;
+  const info = state.runs[rid];
+  let dataset = info.params.data_run_id;
+  if (!dataset || dataset === 'None') {
+    dataset = prompt(`This run predates data_run_id logging.\n` +
+                     `Dataset run id for ${info.run_name}:`);
+    if (!dataset) return;
+  }
+  btn.disabled = true;
+  btn.textContent = 'Building… (reads the dataset from S3, takes a few minutes)';
+  try {
+    const res = await fetch('/api/build_samples', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ run: rid, dataset, n: 300 }),
+    });
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    info.has_samples = true;
+    await loadSamples(rid);
+    onResumeChanged();
+    btn.textContent = `✓ ${data.n_samples} resumes from ${data.n_test_pairs.toLocaleString()} test pairs`
+      + (data.split_column ? ' (split column)' : ' (holdout draw)');
+  } catch (e) {
+    btn.textContent = '⟳ Build from dataset';
+    alert(`Build failed: ${e.message}`);
+  } finally {
+    btn.disabled = false;
+    setTimeout(() => { btn.textContent = '⟳ Build from dataset'; }, 8000);
+  }
 }
 
 function renderRunProps() {
@@ -243,7 +352,8 @@ function renderSampleList() {
     (!cat || s.category === cat) &&
     (!q || s.label.includes(q) || s.context_tokens.join(' ').includes(q)));
   if (!items.length) {
-    list.innerHTML = '<div class="sample-item">No samples — run scripts/prepare_samples.py</div>';
+    list.innerHTML = '<div class="sample-item">No resumes staged for this run — ' +
+      'use “⟳ Build from dataset” above to reconstruct its held-out test resumes.</div>';
     return;
   }
   for (const s of items) {
@@ -441,7 +551,6 @@ function renderTokenPreview(oov = []) {
 function onResumeChanged(rerenderView = true) {
   if (rerenderView) renderResumeView();
   renderTokenPreview();
-  $('#sense-check').innerHTML = '';
 }
 
 /* ── Prediction ─────────────────────────────────────────────────────────── */
@@ -475,26 +584,48 @@ async function predict() {
   }
 }
 
+// The target's rank in one model's ranking, as a per-column header banner —
+// sits directly over that model's predictions for side-by-side comparison.
+function senseHtml(r, target) {
+  // Empty placeholder keeps the card's grid rows aligned across models.
+  if (!target || r.target_rank === undefined) return '<div class="sense empty"></div>';
+  const rank = r.target_rank;
+  const n = r.n_ranked;
+  const cls = rank === null ? 'bad' : rank <= 10 ? 'good' : rank <= 100 ? 'mid' : 'bad';
+  const msg = rank === null
+    ? 'not in this model\'s ranking domain'
+    : `ranked <b>#${rank}</b> of ${n ? n.toLocaleString() + ' ' : ''}titles`;
+  return `<div class="sense ${cls}">actual: “${target.replace('W_TITLE:', '')}” — ${msg}</div>`;
+}
+
 function renderPredictions() {
   const { results, target } = state.lastPrediction;
   const box = $('#predictions');
   box.innerHTML = '';
-  const sense = $('#sense-check');
-  sense.innerHTML = '';
 
   for (const [rid, r] of Object.entries(results)) {
     const name = r.label || rid;
     const card = document.createElement('div');
     card.className = 'pred-card';
     if (r.error) {
-      card.innerHTML = `<h3>${name}</h3><p class="warn">${r.error}</p>`;
+      card.innerHTML = `<h3>${name}</h3><div class="sense empty"></div>
+        <div class="conf empty"></div><p class="warn">${r.error}</p>`;
       box.appendChild(card);
       continue;
     }
     const scoreLabel = r.architecture === 'item2vec' ? 'cosine' : 'probability';
     const nRanked = r.n_ranked ? ` · ranked over ${r.n_ranked.toLocaleString()} titles` : '';
-    let html = `<h3>${name} <span class="hint">(${scoreLabel}${nRanked})</span></h3>`;
+    // Trained date + logged test R@10 beside the model name, as in the dropdown
+    const info = state.runs[rid] || {};
+    const date = runDate(info);
+    const r10 = info.metrics && info.metrics.test_recall_at_10 !== undefined
+      ? `<span class="hint">R@10 ${info.metrics.test_recall_at_10.toFixed(3)}</span>` : '';
+    let html = `<h3>${name}
+      ${date ? `<span class="run-date">${date}</span>` : ''} ${r10}
+      <span class="hint">(${scoreLabel}${nRanked})</span></h3>`;
+    html += senseHtml(r, target);
     html += confidenceHtml(r.confidence);
+    html += '<div class="pred-list">';
     const max = Math.max(...r.predictions.map(p => p.score), 1e-9);
     r.predictions.forEach((p, i) => {
       const title = p.token.replace('W_TITLE:', '');
@@ -512,6 +643,7 @@ function renderPredictions() {
     if (r.unknown_tokens && r.unknown_tokens.length) {
       html += `<p class="warn">Ignored ${r.unknown_tokens.length} out-of-vocabulary token(s)</p>`;
     }
+    html += '</div>';   // .pred-list
     card.innerHTML = html;
     // Drill-down: click a predicted title to open the full-page inspector
     // (bert4rec logit lens + attention; item2vec token contributions).
@@ -521,20 +653,20 @@ function renderPredictions() {
       row.onclick = () => openInspect(rid, r.predictions[i].token);
     });
     box.appendChild(card);
+  }
 
-    if (target && r.target_rank !== undefined) {
-      const div = document.createElement('div');
-      const rank = r.target_rank;
-      const n = r.n_ranked || (state.titleCounts ? state.titleCounts[rid] : null);
-      const cls = rank === null ? 'bad' : rank <= 10 ? 'good' : rank <= 100 ? 'mid' : 'bad';
-      const msg = rank === null
-        ? 'not in this model\'s ranking domain (not ranked)'
-        : `ranked <b>#${rank}</b> of ${n ? n.toLocaleString() + ' ' : ''}rankable titles`;
-      div.className = 'sense ' + cls;
-      div.innerHTML = `<b>${name}</b> — actual next role
-        “${target.replace('W_TITLE:', '')}” ${msg}`;
-      sense.appendChild(div);
-    }
+  // Unified scrolling: scrolling one model's rows scrolls every column, so
+  // rank N stays level across models. Programmatic scrollTop sets fire scroll
+  // events too, but the equality guard stops any feedback loop.
+  const lists = [...box.querySelectorAll('.pred-list')];
+  for (const list of lists) {
+    list.onscroll = () => {
+      for (const other of lists) {
+        if (other !== list && other.scrollTop !== list.scrollTop) {
+          other.scrollTop = list.scrollTop;
+        }
+      }
+    };
   }
 }
 
@@ -563,7 +695,7 @@ function openInspect(rid, title) {
 // High entropy / tiny margin = the model is spreading probability thinly and is
 // effectively guessing (the BERT4Rec story).
 function confidenceHtml(c) {
-  if (!c) return '';
+  if (!c) return '<div class="conf empty"></div>';   // placeholder keeps rows aligned
   const ent = c.entropy;                 // 0 = certain, 1 = uniform
   const certainty = 1 - ent;             // flip so the bar reads "how sure"
   const label = ent >= 0.9 ? 'very unsure' : ent >= 0.75 ? 'unsure'
@@ -980,6 +1112,7 @@ $('#resume-source').onchange = async (e) => {
   await loadSamples(e.target.value);
   onResumeChanged();
 };
+$('#build-samples').onclick = buildSamples;
 $('#add-work').onclick = () => addEntry('WORK');
 $('#add-education').onclick = () => addEntry('EDUCATION');
 $('#add-skills').onclick = () => addEntry('SKILLS');

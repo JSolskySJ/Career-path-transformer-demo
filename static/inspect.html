@@ -26,6 +26,20 @@
   .inspector .contrib-row .tok { max-width: 420px; }
   .inspector .contrib-row .bar-wrap { max-width: 500px; }
   .inspector .err { color: #b91c1c; }
+  .inspector h4 { font-size: 12.5px; margin: 10px 0 2px; color: var(--ink); }
+  .inspector details.flow-details { margin: 4px 0 10px; }
+  .inspector details.flow-details > summary { cursor: pointer; color: var(--accent); font-size: 12.5px; }
+  .inspector .weights-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 10px;
+    margin-top: 6px;
+  }
+  .inspector .weights-grid .hint { margin: 0 0 2px; }
+  .inspector .bar-pair { flex: 1; display: flex; flex-direction: column; gap: 2px; max-width: 500px; }
+  .inspector .bar-pair .bar-wrap { max-width: none; }
+  .inspector .contrib-row .bar.vw { background: #b91c1c; }
+  .inspector .contrib-row .score { width: 110px; }
 </style>
 </head>
 <body>
@@ -78,34 +92,52 @@ function renderItem2vec(data) {
       </div>`).join('')}`;
 }
 
+// Diverging scale for SIGNED data (learned weights, hidden-state values):
+// blue = negative, neutral surface at zero, red = positive.
+const DIV_SCALE = [[0, '#1e40af'], [0.5, '#f8fafc'], [1, '#b91c1c']];
+
+// Generic heatmap helper — signed data gets the diverging scale centred on 0.
+function heat(el, z, o = {}) {
+  Plotly.newPlot(el, [{
+    z, type: 'heatmap',
+    ...(o.signed ? { colorscale: DIV_SCALE, zmid: 0 } : { colorscale: ATTN_SCALE, zmin: 0 }),
+    ...(o.zmax !== undefined ? { zmax: o.zmax } : {}),
+    ...(o.customdata ? { customdata: o.customdata } : {}),
+    ...(o.text ? { texttemplate: '%{z:.2f}', textfont: { size: 9 } } : {}),
+    colorbar: { thickness: 8, tickfont: { size: 8 } },
+    hovertemplate: o.hover || 'row %{y} · col %{x}<br>%{z:.4f}<extra></extra>',
+  }], {
+    margin: { l: o.ml || 60, r: 46, t: 6, b: o.mb || 42 },
+    xaxis: { tickfont: { size: 8 }, ...(o.xaxis || {}) },
+    yaxis: { tickfont: { size: 8 }, ...(o.yaxis || {}) },
+    ...(o.shapes ? { shapes: o.shapes } : {}),
+    height: o.height || 240,
+  }, { displayModeBar: false, responsive: true });
+  return el;
+}
+
+function section(parent, title, hint, open = false, kind = 'h2') {
+  const head = document.createElement(kind);
+  head.innerHTML = `${title} ${hint ? `<span class="hint">${hint}</span>` : ''}`;
+  parent.appendChild(head);
+  const div = document.createElement('div');
+  parent.appendChild(div);
+  return div;
+}
+
+function collapsible(parent, summary, open = false) {
+  const det = document.createElement('details');
+  det.className = 'flow-details';
+  det.open = open;
+  det.innerHTML = `<summary>${summary}</summary>`;
+  parent.appendChild(det);
+  return det;
+}
+
 function renderBert4rec(data) {
   const box = $('#content');
-  const lensRows = data.layers.map(l => `
-    <tr><td>${l.name}</td>
-      <td>${l.title_logit.toFixed(3)}</td>
-      <td>${l.title_prob !== undefined ? (l.title_prob * 100).toFixed(3) + '%' : '—'}</td>
-      <td>${l.title_rank !== undefined ? '#' + l.title_rank : '—'}</td>
-      <td>${l.top_titles.map(t => `${t.title} (${(t.prob * 100).toFixed(1)}%)`).join(' · ')}</td>
-    </tr>`).join('');
-  box.innerHTML = `
-    ${data.faithful === false
-      ? '<p class="err">The instrumented re-run diverged from the encoder — treat these internals as approximate.</p>' : ''}
-    <h2>Logit lens <span class="hint">the [MASK] hidden state after each layer,
-      projected through the output head — where this title's score forms</span></h2>
-    <table class="kv lens">
-      <tr><th>after</th><th>title logit</th><th>in-domain prob</th><th>rank</th>
-          <th>top titles at this depth</th></tr>
-      ${lensRows}
-    </table>
-    <h2>Attention <span class="hint">full query × key matrices per layer and head.
-      Rows are queries, columns what they attend to; the red-outlined bottom row is
-      [MASK] — the prediction query. Values are printed when they fit; hover always
-      shows the exact weight. All panels share ONE colour/bar scale, so equal
-      colour or bar length means equal weight across every layer and head.</span></h2>
-    <div id="attn"></div>`;
-
-  const attn = $('#attn');
   const L = data.labels.length;
+  const d = data.d_model;
   const showValues = L <= 28;                       // printed weights when readable
 
   // Full prefixed tokens for the axes, colour-coded like the header chips
@@ -121,64 +153,183 @@ function renderBert4rec(data) {
   const tickvals = [...fullTokens.keys()];
   const ticktext = fullTokens.map((f, i) =>
     `<span style="color:${tickColor(i)}">${trunc(f)}</span>`);
+  const tokenAxis = { tickmode: 'array', tickvals, ticktext };
   // Numeric axes + explicit tick text: keeps duplicate tokens (two identical
   // tenures/skills) as separate positions — category axes would merge them.
   const customdata = fullTokens.map(q => fullTokens.map(k => [q, k]));
   const maxLabel = Math.max(...fullTokens.map(f => Math.min(f.length, 34)));
+  const tokML = Math.min(260, 7 * maxLabel + 50);
 
-  // ONE shared scale across every layer and head — per-panel auto-scaling would
-  // make the same colour/bar length mean different weights in different panels.
+  const lensRows = data.layers.map(l => `
+    <tr><td>${l.name}</td>
+      <td>${l.title_logit.toFixed(3)}</td>
+      <td>${l.title_prob !== undefined ? (l.title_prob * 100).toFixed(3) + '%' : '—'}</td>
+      <td>${l.title_rank !== undefined ? '#' + l.title_rank : '—'}</td>
+      <td>${l.top_titles.map(t => `${t.title} (${(t.prob * 100).toFixed(1)}%)`).join(' · ')}</td>
+    </tr>`).join('');
+  box.innerHTML = `
+    ${data.faithful === false
+      ? '<p class="err">The instrumented re-run diverged from the encoder — treat these internals as approximate.</p>' : ''}
+    <h2>Logit lens <span class="hint">the [MASK] hidden state after each layer,
+      projected through the (tied) output head — where this title's score forms.
+      The rest of this page IS the model, in forward-pass order: input embeddings
+      → per-layer attention heads (their learned weights, patterns and actual
+      influence) → FFN weights → the residual-stream trace of every token.</span></h2>
+    <table class="kv lens">
+      <tr><th>after</th><th>title logit</th><th>in-domain prob</th><th>rank</th>
+          <th>top titles at this depth</th></tr>
+      ${lensRows}
+    </table>`;
+
+  // ── 1 · Input embeddings ─────────────────────────────────────────────────
+  const emb = section(box, '1 · Input embeddings',
+    `each token's vector entering the encoder (embedding + position, normalised)
+     — rows are tokens, columns the ${d} model dimensions`);
+  heat(emb.appendChild(document.createElement('div')), data.trace.vectors[0], {
+    signed: true, ml: tokML, yaxis: { ...tokenAxis, autorange: 'reversed' },
+    hover: 'dim %{x}<br>%{y}<br>value %{z:.3f}<extra></extra>',
+    height: Math.max(220, 13 * L + 90),
+  });
+
+  // Shared scales so equal colour/bar = equal value across every layer & head.
   const attnMax = Math.max(1e-9, ...data.layers.filter(l => l.attention)
     .flatMap(l => l.attention.flat(2)));
+  const vwMax = Math.max(1e-9, ...data.layers.filter(l => l.mask_value_weighted)
+    .flatMap(l => l.mask_value_weighted.flat()));
+
+  // ── 2 · Encoder layers ───────────────────────────────────────────────────
+  const enc = section(box, '2 · Encoder layers',
+    `per head: the learned projections (W<sub>Q</sub>/W<sub>K</sub>/W<sub>V</sub>
+     rows for the head, W<sub>O</sub> columns that write it back), the attention
+     pattern, and the [MASK] influence — attention weight × the norm of the
+     value the token writes (what actually moves the prediction). Attention
+     panels share one scale; influence bars share another.`);
 
   for (const layer of data.layers) {
     if (!layer.attention) continue;
+    const lh = document.createElement('h3');
+    lh.textContent = layer.name;
+    enc.appendChild(lh);
+
     layer.attention.forEach((matrix, h) => {
-      const head = document.createElement('h3');
-      head.textContent = `${layer.name} · head ${h + 1}`;
-      attn.appendChild(head);
+      const hh = document.createElement('h4');
+      hh.textContent = `head ${h + 1}`;
+      enc.appendChild(hh);
 
-      const plot = document.createElement('div');
-      plot.className = 'heatmap';
-      attn.appendChild(plot);
-      Plotly.newPlot(plot, [{
-        z: matrix, type: 'heatmap',
-        customdata,
-        colorscale: ATTN_SCALE, zmin: 0, zmax: attnMax,
-        ...(showValues ? { texttemplate: '%{z:.2f}', textfont: { size: 9 } } : {}),
-        colorbar: { thickness: 10, tickfont: { size: 9 } },
-        hovertemplate: 'query %{customdata[0]}<br>key %{customdata[1]}<br>' +
-                       'weight %{z:.4f}<extra></extra>',
-      }], {
-        margin: { l: Math.min(260, 7 * maxLabel + 50), r: 60, t: 8,
-                  b: Math.min(220, 6 * maxLabel + 60) },
-        xaxis: { tickmode: 'array', tickvals, ticktext, tickfont: { size: 9 }, tickangle: 45 },
-        yaxis: { tickmode: 'array', tickvals, ticktext, tickfont: { size: 9 },
-                 autorange: 'reversed' },
-        shapes: [{ type: 'rect', x0: -0.5, x1: L - 0.5, y0: L - 1.5, y1: L - 0.5,
-                   line: { color: '#dc2626', width: 2 } }],
-        height: Math.min(1400, Math.max(420, 20 * L + 200)),
-      }, { displayModeBar: false, responsive: true });
+      // (a) the head's learned weights — collapsed by default
+      const wdet = collapsible(enc,
+        `projection weights — W_Q, W_K, W_V (head rows × ${d} dims) and W_O<sup>T</sup> (write-back)`);
+      const grid = document.createElement('div');
+      grid.className = 'weights-grid';
+      wdet.appendChild(grid);
+      const W = layer.heads[h];
+      for (const [name, z] of [['W_Q', W.wq], ['W_K', W.wk], ['W_V', W.wv], ['W_Oᵀ', W.wo_t]]) {
+        const cell = document.createElement('div');
+        cell.innerHTML = `<p class="hint">${name}</p>`;
+        grid.appendChild(cell);
+        heat(cell.appendChild(document.createElement('div')), z, {
+          signed: true, ml: 40, mb: 30, height: 190,
+          hover: name + ' head-dim %{y} · model-dim %{x}<br>%{z:.3f}<extra></extra>',
+        });
+      }
 
-      // Every [MASK] weight for this head, sorted — the prediction query in
-      // full. Bars are on the SAME shared scale as the heatmaps (attnMax), so
-      // they compare directly across heads and layers.
+      // (b) attention pattern
+      heat(enc.appendChild(Object.assign(document.createElement('div'), { className: 'heatmap' })),
+        matrix, {
+          zmax: attnMax, customdata, text: showValues,
+          ml: tokML, mb: Math.min(220, 6 * maxLabel + 60),
+          xaxis: { ...tokenAxis, tickangle: 45 },
+          yaxis: { ...tokenAxis, autorange: 'reversed' },
+          hover: 'query %{customdata[0]}<br>key %{customdata[1]}<br>weight %{z:.4f}<extra></extra>',
+          shapes: [{ type: 'rect', x0: -0.5, x1: L - 0.5, y0: L - 1.5, y1: L - 0.5,
+                     line: { color: '#dc2626', width: 2 } }],
+          height: Math.min(1400, Math.max(420, 20 * L + 200)),
+        });
+
+      // (c) [MASK] influence — attention vs value-weighted, sorted by the latter
+      const vw = layer.mask_value_weighted[h];
       const maskRow = matrix[L - 1];
-      const order = [...maskRow.keys()].sort((a, b) => maskRow[b] - maskRow[a]);
-      const det = document.createElement('details');
-      det.className = 'mask-weights';
-      det.innerHTML = `<summary>[MASK] attention weights, sorted (${L} positions,
-          bars on the shared scale)</summary>
-        ${order.map(i => `
-          <div class="contrib-row">
-            <span class="tok ${data.token_types[i]}">${fullTokens[i]}</span>
+      const order = [...vw.keys()].sort((a, b) => vw[b] - vw[a]);
+      const det = collapsible(enc,
+        `[MASK] influence, sorted — attention (blue) vs value-weighted (red), ${L} positions`, true);
+      det.classList.add('mask-weights');
+      det.insertAdjacentHTML('beforeend', order.map(i => `
+        <div class="contrib-row">
+          <span class="tok ${data.token_types[i]}">${fullTokens[i]}</span>
+          <span class="bar-pair">
             <span class="bar-wrap"><span class="bar"
               style="width:${Math.max(1, 100 * maskRow[i] / attnMax)}%"></span></span>
-            <span class="score">${maskRow[i].toFixed(4)}</span>
-          </div>`).join('')}`;
-      attn.appendChild(det);
+            <span class="bar-wrap"><span class="bar vw"
+              style="width:${Math.max(1, 100 * vw[i] / vwMax)}%"></span></span>
+          </span>
+          <span class="score">${maskRow[i].toFixed(3)} · ${vw[i].toFixed(3)}</span>
+        </div>`).join(''));
     });
+
+    // (d) the layer's FFN weights
+    const f = collapsible(enc,
+      `${layer.name} · FFN weights — W₁ (${layer.ffn.w1.length}×${d}, expand) then W₂ (${d}×${layer.ffn.w2[0].length}, contract)`);
+    for (const [name, z] of [['W₁', layer.ffn.w1], ['W₂', layer.ffn.w2]]) {
+      f.insertAdjacentHTML('beforeend', `<p class="hint">${name}</p>`);
+      heat(f.appendChild(document.createElement('div')), z, {
+        signed: true, ml: 44, mb: 30, height: name === 'W₁' ? 420 : 190,
+        hover: name + ' out %{y} · in %{x}<br>%{z:.3f}<extra></extra>',
+      });
+    }
   }
+
+  // ── 3 · Residual-stream trace, per token ─────────────────────────────────
+  const tr = data.trace;
+  const S = tr.stages.length;
+  const trace = section(box, '3 · Residual-stream trace',
+    `every token's hidden state at every point in the forward pass. Overview:
+     how strongly each stage rewrites each token (L2 norm). Pick a token to see
+     its full ${d}-dim vector at every stage and what title it resembles there.`);
+
+  const norms = tr.vectors.map(stage =>
+    stage.map(vec => Math.sqrt(vec.reduce((s, v) => s + v * v, 0))));
+  heat(trace.appendChild(document.createElement('div')), norms, {
+    ml: 150, mb: Math.min(220, 6 * maxLabel + 60),
+    xaxis: { ...tokenAxis, tickangle: 45 },
+    yaxis: { tickmode: 'array', tickvals: [...tr.stages.keys()], ticktext: tr.stages,
+             autorange: 'reversed' },
+    hover: '%{y}<br>token %{x}<br>‖h‖ %{z:.2f}<extra></extra>',
+    height: 60 + 34 * S,
+  });
+
+  const sel = document.createElement('p');
+  sel.innerHTML = `Trace token: <select id="trace-token">${fullTokens.map((f, i) =>
+    `<option value="${i}" ${i === L - 1 ? 'selected' : ''}>${f}</option>`).join('')}</select>`;
+  trace.appendChild(sel);
+  const tokenPlot = trace.appendChild(document.createElement('div'));
+  const tokenLens = trace.appendChild(document.createElement('div'));
+
+  function drawTokenTrace(pos) {
+    tokenPlot.innerHTML = '';
+    heat(tokenPlot.appendChild(document.createElement('div')),
+      tr.vectors.map(stage => stage[pos]), {
+        signed: true, ml: 150, mb: 30,
+        yaxis: { tickmode: 'array', tickvals: [...tr.stages.keys()], ticktext: tr.stages,
+                 autorange: 'reversed' },
+        hover: '%{y}<br>dim %{x}<br>value %{z:.3f}<extra></extra>',
+        height: 60 + 34 * S,
+      });
+    tokenLens.innerHTML = `<table class="kv lens">
+      <tr><th>stage</th><th>closest title (tied head)</th><th>prob</th></tr>
+      ${tr.stages.map((s, si) => `<tr><td>${s}</td>
+        <td>${tr.top1[si][pos].title}</td>
+        <td>${(tr.top1[si][pos].prob * 100).toFixed(2)}%</td></tr>`).join('')}
+    </table>`;
+  }
+  drawTokenTrace(L - 1);
+  sel.querySelector('select').onchange = (e) => drawTokenTrace(+e.target.value);
+
+  // ── 4 · Output head ──────────────────────────────────────────────────────
+  section(box, '4 · Output head',
+    'weight-tied to the input embedding table (section 1 shows those same ' +
+    'vectors) — every hidden state is scored by dot product against all ' +
+    'vocabulary embeddings. The logit-lens table at the top and the per-stage ' +
+    'titles in the trace are exactly this projection.');
 }
 
 (async function init() {

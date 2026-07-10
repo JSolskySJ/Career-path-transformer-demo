@@ -71,6 +71,10 @@ main {
   resize: horizontal;
   overflow: auto;
 }
+/* min-width: 0 lets the 1fr track shrink to the viewport — wide content
+   (many model columns) then scrolls INSIDE .predictions-grid instead of
+   stretching the whole page horizontally. */
+#results-panel { min-width: 0; }
 @media (max-width: 1100px) {
   main { grid-template-columns: 1fr; }
   #input-panel { width: auto; resize: none; }
@@ -250,8 +254,70 @@ details.exp.skills .skill-list { margin: 6px 0 2px 26px; }
   text-transform: none;
 }
 
-/* Model selection + per-run info dropdown */
+/* Model selection — dropdown list selector */
 #model-select { margin-bottom: 10px; }
+#model-select details.dropdown > summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 7px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#model-select details.dropdown > summary::-webkit-details-marker { display: none; }
+#model-select details.dropdown > summary::after { content: ' ▾'; color: var(--muted); }
+#model-select details.dropdown[open] > summary::after { content: ' ▴'; }
+#model-select .dropdown-body {
+  border: 1px solid var(--line);
+  border-top: none;
+  border-radius: 0 0 8px 8px;
+  padding: 6px 8px;
+  max-height: 340px;
+  overflow-y: auto;
+  background: #fff;
+}
+.model-filter {
+  padding-bottom: 6px;
+  margin: 0 0 6px;
+  border-bottom: 1px solid var(--line);
+}
+.model-filter label { display: flex; align-items: center; gap: 6px; font-size: 12.5px; }
+.model-filter input[type=date] { padding: 4px 7px; font-size: 12px; }
+.model-row.unavailable { opacity: 0.75; background: #fafbfd; }
+.model-row.unavailable label { cursor: default; }
+.model-row .warn { font-size: 11px; }
+
+/* Run-parameter comparison table (params from MLflow run.json) */
+.compare-params > summary { cursor: pointer; color: var(--accent); font-size: 12.5px; padding: 5px 2px; }
+.compare-wrap { overflow-x: auto; max-height: 420px; overflow-y: auto; margin-top: 4px; }
+table.kv.compare th {
+  text-align: left;
+  font-size: 11px;
+  padding: 3px 10px 3px 0;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+  vertical-align: bottom;
+  background: #fff;
+  position: sticky;
+  top: 0;
+}
+table.kv.compare td { white-space: nowrap; font-size: 11.5px; }
+table.kv.compare td:first-child,
+table.kv.compare th:first-child {
+  position: sticky;
+  left: 0;
+  background: #fff;
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 11px;
+  color: var(--muted);
+}
+table.kv.compare tr.diff td { background: #fff8e6; font-weight: 600; }
+table.kv.compare tr.diff td:first-child { background: #fff8e6; color: var(--ink); }
+table.kv.compare tr.metric td:not(:first-child) { color: var(--accent); }
 .model-row {
   display: flex;
   justify-content: space-between;
@@ -264,12 +330,14 @@ details.exp.skills .skill-list { margin: 6px 0 2px 26px; }
 }
 .model-row label { display: flex; align-items: center; gap: 7px; cursor: pointer; }
 .model-row label .hint { font-size: 11.5px; }
-.model-row label .run-date {
+.run-date {
   font: 11px ui-monospace, Menlo, monospace;
+  font-weight: 400;
   color: var(--muted);
   background: #eef2f7;
   border-radius: 8px;
   padding: 1px 6px;
+  vertical-align: middle;
 }
 .model-row details.model-info { position: relative; font-size: 12.5px; }
 .model-row details.model-info summary {
@@ -359,21 +427,43 @@ table.kv td:first-child { color: var(--muted); font-family: ui-monospace, Menlo,
 .controls input[type=number] { width: 64px; margin-left: 6px; }
 
 /* Predictions — one column per model, horizontal scrollbar at the bottom when
-   more models are selected than fit; fixed height with internal vertical
-   scroll so the embedding graph below never moves */
+   more models are selected than fit. User-resizable vertically (native drag
+   grip, bottom-right corner) to show more titles per page; the embedding
+   graph below only moves when you resize it yourself. */
 .predictions-grid {
   display: grid;
   grid-auto-flow: column;
   grid-auto-columns: minmax(300px, 1fr);
+  /* Four shared row tracks — header / actual-rank / confidence / rows — that
+     every model card subgrids into, so the sections align across columns
+     whatever wraps or is missing. */
+  grid-template-rows: auto auto auto 1fr;
   gap: 12px;
   align-content: start;
   height: 330px;
-  overflow: auto;
+  min-height: 160px;
+  max-height: 85vh;
+  resize: vertical;
+  /* Horizontal scroll between models stays on this box; vertical scrolling
+     happens INSIDE each column's rows track (.pred-list), so the model name,
+     actual-rank banner and confidence stay pinned above it. */
+  overflow-x: auto;
+  overflow-y: hidden;
   border: 1px solid var(--line);
   border-radius: 9px;
   padding: 8px;
 }
-.pred-card { border: none; padding: 2px 6px; }
+.pred-list { overflow-y: auto; min-height: 0; }
+.pred-card {
+  border: none;
+  padding: 2px 6px;
+  display: grid;
+  grid-template-rows: subgrid;
+  grid-row: span 4;
+  align-content: start;
+}
+/* Placeholders occupy their shared track without adding height of their own */
+.sense.empty, .conf.empty { padding: 0; margin: 0; border: none; visibility: hidden; }
 .pred-card h3 { margin: 0 0 8px; font-size: 13.5px; }
 .pred-card h3 .hint { font-weight: 400; }
 .pred-row { display: flex; align-items: center; gap: 8px; padding: 2.5px 0; font-size: 13px; }
@@ -410,13 +500,11 @@ table.kv td:first-child { color: var(--muted); font-family: ui-monospace, Menlo,
 .conf.mid .conf-head b { color: #b45309; }
 .conf.lo  .conf-head b { color: #b3261e; }
 
-/* Reserved space for up to two sense-check banners (one per model) so they
-   can appear/clear without moving anything below */
-#sense-check { margin-bottom: 8px; min-height: 86px; }
+/* Target-rank banner — one per model, at the top of its predictions column */
 .sense {
-  border-radius: 8px;
-  padding: 8px 12px;
-  font-size: 13px;
+  border-radius: 7px;
+  padding: 5px 9px;
+  font-size: 12px;
   margin-bottom: 6px;
 }
 .sense.good { background: #e6f6ee; color: #065f46; }

@@ -37,16 +37,62 @@ def inspect_model(model, architecture, tokens, title):
 # ── bert4rec ─────────────────────────────────────────────────────────────────
 
 def _layer_forward(layer, x, kpm):
-    """One post-norm TransformerEncoderLayer step, returning (x, attn_weights).
-    Identical to layer(x, src_key_padding_mask=kpm) in eval mode, but with
-    need_weights=True so the per-head attention comes back."""
+    """One post-norm TransformerEncoderLayer step, returning
+    (x_out, attn_weights, attn_block_out, x_after_attn) — identical maths to
+    layer(x, src_key_padding_mask=kpm) in eval mode, but with need_weights=True
+    and the residual-stream intermediates exposed for the trace."""
     import torch  # noqa: F401  (torch types flow through)
     sa_out, w = layer.self_attn(x, x, x, key_padding_mask=kpm,
                                 need_weights=True, average_attn_weights=False)
-    x = layer.norm1(x + layer.dropout1(sa_out))
-    ff = layer.linear2(layer.dropout(layer.activation(layer.linear1(x))))
-    x = layer.norm2(x + layer.dropout2(ff))
-    return x, w
+    x1 = layer.norm1(x + layer.dropout1(sa_out))
+    ff = layer.linear2(layer.dropout(layer.activation(layer.linear1(x1))))
+    x2 = layer.norm2(x1 + layer.dropout2(ff))
+    return x2, w, sa_out, x1
+
+
+def _head_weights(layer, d_model, n_heads):
+    """Per-head slices of the attention projections, display-shaped (head_dim ×
+    d_model): W_Q, W_K, W_V rows for this head, and the head's W_O columns
+    (transposed) — the matrix that writes the head's output back into the
+    residual stream."""
+    import numpy as np
+    hd = d_model // n_heads
+    W = layer.self_attn.in_proj_weight.detach().numpy()
+    Wq, Wk, Wv = W[:d_model], W[d_model:2 * d_model], W[2 * d_model:]
+    Wo = layer.self_attn.out_proj.weight.detach().numpy()
+    out = []
+    for h in range(n_heads):
+        s = slice(h * hd, (h + 1) * hd)
+        out.append({
+            'wq': np.round(Wq[s], 3).tolist(),
+            'wk': np.round(Wk[s], 3).tolist(),
+            'wv': np.round(Wv[s], 3).tolist(),
+            'wo_t': np.round(Wo[:, s].T, 3).tolist(),
+        })
+    return out
+
+
+def _mask_value_weighted(layer, x_in, attn, pad_n, d_model, n_heads):
+    """What each source token ACTUALLY contributes to the [MASK] query through
+    each head: attention weight × the norm of the token's value vector
+    projected through the head's W_O — attention alone ignores how big the
+    written vector is. Returns (heads, L_used) norms."""
+    import numpy as np
+    import torch
+    hd = d_model // n_heads
+    sa = layer.self_attn
+    Wv = sa.in_proj_weight[2 * d_model:]
+    bv = sa.in_proj_bias[2 * d_model:] if sa.in_proj_bias is not None else 0
+    with torch.no_grad():
+        v = x_in[0] @ Wv.t() + bv                        # (L_full, d)
+        rows = []
+        for h in range(n_heads):
+            s = slice(h * hd, (h + 1) * hd)
+            proj = v[:, s] @ sa.out_proj.weight[:, s].t()  # what j writes if fully attended
+            norms = proj.norm(dim=1)                       # (L_full,)
+            contrib = attn[h, -1] * norms                  # × [MASK]-row attention
+            rows.append(np.round(contrib[pad_n:].numpy(), 4).tolist())
+    return rows
 
 
 def _logit_lens(model, hidden_mask, title_id, title_ids, idx2str, top_k=5):
@@ -91,16 +137,35 @@ def inspect_bert4rec(m, tokens, title):
     labels = [_short(t) for t in used] + ['[MASK]']
     types = [t.split(':', 1)[0] for t in used] + ['MASK']
 
+    d_model = model.item_emb.weight.shape[1]
+    n_heads = int(model.encoder.layers[0].self_attn.num_heads)
+
     model.eval()
     with torch.no_grad():
         pos = torch.arange(m._max_len)
         x = model.dropout(model.norm(model.item_emb(ids_t) + model.pos_emb(pos)))
         x0 = x
-        states, attns = [x], []
-        for layer in model.encoder.layers:
-            x, w = _layer_forward(layer, x, kpm)
+        # Residual-stream trace: (stage name, (1, L_full, d)) at every point in
+        # the forward pass, so any token can be followed through the model.
+        trace_stages = [('embedding + position', x0)]
+        states, attns, layer_extras = [x], [], []
+        for li, layer in enumerate(model.encoder.layers, start=1):
+            x_in = x
+            x, w, sa_out, x_after_attn = _layer_forward(layer, x, kpm)
             states.append(x)
             attns.append(w[0])                        # (heads, L, L)
+            trace_stages += [(f'L{li} · attention output', sa_out),
+                             (f'L{li} · after attention', x_after_attn),
+                             (f'L{li} · after FFN', x)]
+            layer_extras.append({
+                'heads': _head_weights(layer, d_model, n_heads),
+                'mask_value_weighted': _mask_value_weighted(
+                    layer, x_in, w[0], pad_n, d_model, n_heads),
+                'ffn': {
+                    'w1': np.round(layer.linear1.weight.detach().numpy(), 3).tolist(),
+                    'w2': np.round(layer.linear2.weight.detach().numpy(), 3).tolist(),
+                },
+            })
         # The displayed internals must be the model's own numbers.
         faithful = bool(torch.allclose(
             x, model.encoder(x0, src_key_padding_mask=kpm), atol=1e-4))
@@ -115,16 +180,34 @@ def inspect_bert4rec(m, tokens, title):
                 # per-head attention over the non-pad positions only
                 w = attns[i - 1][:, pad_n:, pad_n:].numpy()
                 entry['attention'] = np.round(w, 4).tolist()
+                entry.update(layer_extras[i - 1])
             layers.append(entry)
+
+        # Per-token trace payload: each stage's hidden vectors (pad-trimmed)
+        # plus a per-token logit-lens readout (top title at that depth).
+        trace = {'stages': [], 'vectors': [], 'top1': []}
+        for name, h in trace_stages:
+            vecs = h[0, pad_n:]                       # (L_used, d)
+            logits = model.head(vecs)[:, title_ids]   # (L_used, |titles|)
+            probs = torch.softmax(logits, dim=-1)
+            top = probs.argmax(dim=-1)
+            trace['stages'].append(name)
+            trace['vectors'].append(np.round(vecs.numpy(), 3).tolist())
+            trace['top1'].append([
+                {'title': _short(vocab.idx2str[int(title_ids[int(t)])]),
+                 'prob': round(float(probs[j, int(t)]), 4)}
+                for j, t in enumerate(top)])
 
     return {
         'architecture': 'bert4rec',
         'title': title,
         'labels': labels,          # axis labels for the attention matrices
         'token_types': types,
-        'n_heads': int(model.encoder.layers[0].self_attn.num_heads),
+        'n_heads': n_heads,
+        'd_model': int(d_model),
         'faithful': faithful,
         'layers': layers,
+        'trace': trace,
     }
 
 

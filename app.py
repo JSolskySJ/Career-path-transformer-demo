@@ -148,6 +148,32 @@ def samples():
     return jsonify({'run': run_id, 'samples': [_with_experiences(s) for s in items]})
 
 
+@app.route('/api/build_samples', methods=['POST'])
+def build_samples():
+    """Rebuild a run's sample resumes straight from its dataset parquet, using
+    the training repo's own load/tokenise/split code. Slow (full parquet read)
+    — only needed when a new dataset is generated (deterministic split)."""
+    payload = request.get_json(force=True)
+    rid = payload.get('run', '')
+    r = RUNS.get(rid)
+    if r is None:
+        return jsonify({'error': f'unknown run {rid}'}), 400
+    dataset = payload.get('dataset') or r['params'].get('data_run_id')
+    if not dataset or str(dataset).lower() == 'none':
+        return jsonify({'error': 'no dataset run id — this run predates data_run_id '
+                                 'param logging; pass one explicitly'}), 400
+    n = int(payload.get('n', 300))
+    out = os.path.join(registry.RUNS_DIR, rid, 'sample_resumes.json')
+    try:
+        from demo.dataset_samples import build_samples_for_run
+        stats = build_samples_for_run(r['params'], str(dataset), out, n=n)
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    r['samples_path'] = out
+    return jsonify({'ok': True, 'run': rid, **stats})
+
+
 @app.route('/api/vocab')
 def vocab():
     """Autocomplete: /api/vocab?type=W_TITLE&q=soft&limit=15[&run=<run_id>]"""

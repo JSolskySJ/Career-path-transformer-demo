@@ -41,7 +41,10 @@ def _load_model(run_dir, architecture, vocab_csv):
         model = Bert4RecModel.load_if_available(
             os.path.join(run_dir, 'bert4rec'), vocab_csv=vocab_csv)
         if model is None:
-            raise FileNotFoundError(f'no bert4rec checkpoint in {run_dir}')
+            raise FileNotFoundError(
+                'no model checkpoint staged — the MLflow run has no logged model '
+                '(still RUNNING, or it finished without logging one); re-fetch '
+                'once the run completes')
         return model
     if architecture == 'item2vec':
         from demo.item2vec_model import Item2VecModel
