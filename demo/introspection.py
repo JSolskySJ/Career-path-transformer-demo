@@ -198,6 +198,34 @@ def inspect_bert4rec(m, tokens, title):
                  'prob': round(float(probs[j, int(t)]), 4)}
                 for j, t in enumerate(top)])
 
+        # Leave-one-out influence: re-run the model with each context token
+        # removed (one batched forward) and measure the change in the clicked
+        # title's logit and in-domain probability. SIGNED and faithful:
+        # positive = the token pushes the prediction TOWARD this title,
+        # negative = it pushes it away.
+        variants = []
+        for j in range(len(ids)):
+            v = ids[:j] + ids[j + 1:]
+            variants.append([vocab.pad_id] * (m._max_len - 1 - len(v)) + v + [vocab.mask_id])
+        batch = torch.tensor([seq] + variants)
+        out = model(batch)[:, -1, :]                  # [MASK] logits per variant
+        dom = out[:, title_ids]
+        dom_probs = torch.softmax(dom, dim=-1)
+        t_pos = (title_ids == title_id).nonzero()
+        t_col = int(t_pos[0, 0]) if len(t_pos) else None
+        base_logit = float(out[0, title_id])
+        base_prob = float(dom_probs[0, t_col]) if t_col is not None else None
+        ablation = {
+            'base_logit': round(base_logit, 4),
+            'base_prob': round(base_prob, 5) if base_prob is not None else None,
+            'tokens': [{
+                'i': j,      # index into labels/token_types (context positions)
+                'delta_logit': round(base_logit - float(out[1 + j, title_id]), 4),
+                'delta_prob': (round(base_prob - float(dom_probs[1 + j, t_col]), 5)
+                               if t_col is not None else None),
+            } for j in range(len(ids))],
+        }
+
     return {
         'architecture': 'bert4rec',
         'title': title,
@@ -206,6 +234,7 @@ def inspect_bert4rec(m, tokens, title):
         'n_heads': n_heads,
         'd_model': int(d_model),
         'faithful': faithful,
+        'ablation': ablation,
         'layers': layers,
         'trace': trace,
     }

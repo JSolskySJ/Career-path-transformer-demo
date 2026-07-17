@@ -8,6 +8,7 @@ side, so several versions of the same architecture can be compared.
 Run:  ./run.sh   (or: conda run -n dwh-ai-py311 python app.py)
 """
 
+import inspect
 import os
 os.environ.setdefault('KMP_DUPLICATE_LIB_OK', 'TRUE')   # macOS torch/gensim OpenMP clash
 
@@ -18,7 +19,8 @@ from flask import Flask, jsonify, request, send_from_directory
 
 from demo import config, registry
 from demo.embedding_space import map_space
-from demo.tokens import (TOKEN_TYPES, group_into_experiences, tokens_from_resume)
+from demo.tokens import (TOKEN_TYPES, group_into_experiences, rollup_titles,
+                         tokens_from_resume)
 
 app = Flask(__name__, static_folder='static', static_url_path='/static')
 
@@ -28,6 +30,16 @@ TRANSITIONS = {'store': None, 'error': None}
 
 def load_models():
     global RUNS
+    # Auto-sync: stage any FINISHED MLflow runs newer than the registry, so
+    # fresh training runs appear on every start. CPT_AUTO_SYNC=0 disables.
+    if os.environ.get('CPT_AUTO_SYNC', '1') != '0':
+        try:
+            from scripts.fetch_mlflow_artifacts import sync_new_runs
+            n = sync_new_runs()
+            print(f'auto-sync: {n} new run(s) staged from MLflow' if n
+                  else 'auto-sync: registry up to date')
+        except Exception as e:
+            print(f'auto-sync skipped ({e})')
     try:
         RUNS = registry.discover_runs()
     except Exception as e:
@@ -212,12 +224,17 @@ def _domain_tokens(rid, model, domain):
 
 
 def _resolve_tokens(payload: dict) -> list:
-    """Accept either raw tokens or builder experiences."""
+    """Accept either raw tokens or builder experiences, then apply the optional
+    title rollup ('rollup': none | consecutive | all). Applied server-side so
+    the returned tokens — and everything downstream (inspector, space plot) —
+    show exactly what the model saw."""
     if payload.get('tokens'):
-        return list(payload['tokens'])
-    if payload.get('experiences'):
-        return tokens_from_resume(payload['experiences'])
-    return []
+        tokens = list(payload['tokens'])
+    elif payload.get('experiences'):
+        tokens = tokens_from_resume(payload['experiences'])
+    else:
+        return []
+    return rollup_titles(tokens, payload.get('rollup', 'none'))
 
 
 @app.route('/api/predict', methods=['POST'])
@@ -229,6 +246,7 @@ def predict():
     top_k  = int(payload.get('top_k', config.DEFAULT_TOP_K))
     target = payload.get('target')
     domain = payload.get('domain', 'all')
+    scoring = payload.get('scoring', 'softmax')   # bert4rec only; item2vec is cosine-native
     run_ids = payload.get('models') or [rid for rid, r in RUNS.items()
                                         if r['model'] is not None]
 
@@ -247,7 +265,8 @@ def predict():
                                      f'(scripts/build_title_flags.py)',
                             'label': r['label']}
             continue
-        ranked = model.rank_titles(tokens, top_k=top_k, allowed=allowed)
+        kw = {'scoring': scoring} if 'scoring' in inspect.signature(model.rank_titles).parameters else {}
+        ranked = model.rank_titles(tokens, top_k=top_k, allowed=allowed, **kw)
         # SJ / taxonomy-level badges per predicted title
         from demo.title_flags import flags_for
         for p in ranked['predictions']:
@@ -256,7 +275,7 @@ def predict():
             # Sense check: rank of the known correct answer over the same
             # (possibly projected) domain the predictions used
             full = model.rank_titles(tokens, top_k=len(model.title_vocab),
-                                     allowed=allowed)
+                                     allowed=allowed, **kw)
             all_tokens = [p['token'] for p in full['predictions']]
             ranked['target_rank'] = (all_tokens.index(target) + 1
                                      if target in all_tokens else None)

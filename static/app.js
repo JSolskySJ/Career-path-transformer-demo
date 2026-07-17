@@ -202,20 +202,30 @@ function renderModelSelect(keepOpen = false) {
   dd.innerHTML = `<summary>${modelSummaryText()}</summary><div class="dropdown-body"></div>`;
   const body = dd.querySelector('.dropdown-body');
 
-  // Date filter — hide runs trained before the cutoff (selected runs and
-  // undated legacy checkpoints always stay visible).
+  // Date filter — STRICTLY hide runs trained before the cutoff (undated
+  // legacy checkpoints excepted). A selected model that falls outside the
+  // filter stays selected (and predicted) but is hidden like the rest — the
+  // hint calls that out so the filter never looks broken.
   const cutoffMs = state.modelDateCutoff ? Date.parse(state.modelDateCutoff) : 0;
   const all = runsByDate();
-  const ordered = all.filter(([rid, i]) =>
-    state.selectedModels.has(rid) || !cutoffMs || !+i.start_time || +i.start_time >= cutoffMs);
+  const ordered = all.filter(([, i]) =>
+    !cutoffMs || !+i.start_time || +i.start_time >= cutoffMs);
   const nHidden = all.length - ordered.length;
+  const visibleIds = new Set(ordered.map(([rid]) => rid));
+  const hiddenSelected = [...state.selectedModels]
+    .filter(rid => state.runs[rid] && !visibleIds.has(rid));
   const filter = document.createElement('div');
   filter.className = 'row model-filter';
   filter.innerHTML = `
     <label>Trained after
       <input type="date" id="model-date-filter" value="${state.modelDateCutoff || ''}">
     </label>
-    <span class="hint">${nHidden ? `${nHidden} older run${nHidden > 1 ? 's' : ''} hidden — clear the date to show all` : 'showing all runs'}</span>`;
+    <span class="hint">${nHidden
+      ? `${nHidden} older run${nHidden > 1 ? 's' : ''} hidden — clear the date to show all`
+      : 'showing all runs'}${hiddenSelected.length
+      ? ` · <b>${hiddenSelected.length} selected model${hiddenSelected.length > 1 ? 's' : ''}
+          hidden but still predicted</b> (${hiddenSelected.map(r => state.runs[r].run_name).join(', ')})`
+      : ''}</span>`;
   filter.querySelector('input').onchange = (e) => {
     state.modelDateCutoff = e.target.value;
     renderModelSelect(true);
@@ -343,13 +353,35 @@ function renderRunProps() {
     <div class="chips-inline">${chips || '<span class="hint">no transformation params recorded</span>'}</div>`;
 }
 
+// Title-repetition profile of a resume — over the context titles PLUS the
+// held-out target, since a target repeating a context title is the
+// repeat-copy case that inflates work-history recall.
+function repeatProfile(s) {
+  const titles = s.context_tokens.filter(t => t.startsWith('W_TITLE:'));
+  if (s.target) titles.push(s.target);
+  const hasConsecutive = titles.some((t, i) => i > 0 && t === titles[i - 1]);
+  const hasRepeats = new Set(titles).size < titles.length;
+  return { hasConsecutive, hasRepeats };
+}
+
+function repeatFilterPass(s, mode) {
+  if (!mode) return true;
+  const p = repeatProfile(s);
+  if (mode === 'no-consecutive') return !p.hasConsecutive;
+  if (mode === 'no-repeats') return !p.hasRepeats;
+  if (mode === 'has-repeats') return p.hasRepeats;
+  return true;
+}
+
 function renderSampleList() {
   const cat = $('#sample-category').value;
+  const rep = $('#sample-repeats').value;
   const q = norm($('#sample-search').value);
   const list = $('#sample-list');
   list.innerHTML = '';
   const items = state.samples.filter(s =>
     (!cat || s.category === cat) &&
+    repeatFilterPass(s, rep) &&
     (!q || s.label.includes(q) || s.context_tokens.join(' ').includes(q)));
   if (!items.length) {
     list.innerHTML = '<div class="sample-item">No resumes staged for this run — ' +
@@ -533,8 +565,10 @@ function renderResumeView() {
   box.appendChild(t);
 }
 
-function renderTokenPreview(oov = []) {
-  const tokens = currentTokens();
+function renderTokenPreview(oov = [], tokensOverride = null) {
+  // After a prediction, show the server-resolved tokens (post-rollup) — what
+  // the model actually consumed; before one, the raw resume tokens.
+  const tokens = tokensOverride || currentTokens();
   const box = $('#token-preview');
   box.innerHTML = '';
   for (const tok of tokens) {
@@ -569,6 +603,8 @@ async function predict() {
         top_k: parseInt($('#top-k').value || '10', 10),
         models: [...state.selectedModels],
         domain: $('#rank-domain').value,
+        scoring: $('#rank-scoring').value,
+        rollup: $('#rollup-mode').value,
       }),
     });
     state.lastPrediction = await res.json();
@@ -577,7 +613,7 @@ async function predict() {
     for (const r of Object.values(state.lastPrediction.results)) {
       (r.unknown_tokens || []).forEach(t => oov.add(t));
     }
-    renderTokenPreview([...oov]);
+    renderTokenPreview([...oov], state.lastPrediction.tokens);
     await drawSpace();
   } finally {
     $('#predict-btn').disabled = false;
@@ -741,6 +777,7 @@ async function drawSpace() {
       tokens, model, mode,
       top_k: parseInt($('#top-k').value || '10', 10),
       domain: $('#rank-domain').value,
+      rollup: $('#rollup-mode').value,
     }),
   });
   const data = await res.json();
@@ -1107,6 +1144,7 @@ document.querySelectorAll('.tab').forEach(tab => {
 });
 
 $('#sample-category').onchange = renderSampleList;
+$('#sample-repeats').onchange = renderSampleList;
 $('#sample-search').oninput = renderSampleList;
 $('#resume-source').onchange = async (e) => {
   await loadSamples(e.target.value);
@@ -1120,6 +1158,7 @@ $('#predict-btn').onclick = predict;
 $('#space-model').onchange = drawSpace;
 $('#space-mode').onchange = drawSpace;
 $('#rank-domain').onchange = () => { if (state.lastPrediction) predict(); };
+$('#rollup-mode').onchange = () => { if (state.lastPrediction) predict(); };
 $('#toggle-space').onclick = () => {
   const hidden = $('#space-section').classList.toggle('hidden');
   $('#toggle-space').textContent = hidden ? 'Show' : 'Hide';

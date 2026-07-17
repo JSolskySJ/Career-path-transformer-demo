@@ -306,6 +306,63 @@ def stage_run(arch, run, files, run_dir, n_samples):
         print(f'  [{arch} {rid[:8]}] no predictions CSV — run has no sample resumes')
 
 
+def sync_new_runs(env='test-prod-sj', ai_conf=None, n_samples=300, max_runs=25):
+    """Stage every FINISHED experiment run newer than the newest staged run that
+    isn't in the registry yet — called by the demo app at startup so fresh
+    training runs appear without a manual fetch. Per-run failures are non-fatal.
+    Returns the number of newly staged runs."""
+    runs_dir = os.path.join(config.ARTIFACTS_DIR, 'runs')
+    staged = set(os.listdir(runs_dir)) if os.path.isdir(runs_dir) else set()
+
+    # Newest staged start_time (ms) minus an hour of slack; 14 days if empty.
+    since = 0
+    for rid in staged:
+        try:
+            with open(os.path.join(runs_dir, rid, 'run.json')) as f:
+                since = max(since, int(json.load(f).get('start_time') or 0))
+        except Exception:
+            pass
+    since = since - 3600_000 if since else _now_ms() - 14 * 86400_000
+
+    partner = env.split('-')[-1]
+    ai_conf = ai_conf or os.path.abspath(os.path.join(
+        config.DEMO_ROOT, '..', 'datawarehouse-configurations', partner, 'ai', 'ai.conf'))
+    mlflow = connect(env, ai_conf)
+    exp = mlflow.get_experiment_by_name(EXPERIMENT.format(partner=partner))
+    if exp is None:
+        return 0
+    df = mlflow.search_runs(
+        experiment_ids=[exp.experiment_id],
+        filter_string=f"attributes.status = 'FINISHED' and attributes.start_time > {since}",
+        order_by=['start_time DESC'], max_results=max_runs)
+    client = mlflow.MlflowClient()
+    inc = os.path.join(config.DEMO_ROOT, 'incoming')
+    os.makedirs(inc, exist_ok=True)
+
+    n_staged = 0
+    for rid in ([] if not len(df) else df['run_id'].tolist()):
+        if rid in staged:
+            continue
+        run = client.get_run(rid)
+        arch = run.data.tags.get('architecture')
+        if arch not in ARCHITECTURES:
+            print(f'[sync] {rid[:8]} ({run.data.tags.get("mlflow.runName")}): '
+                  f'architecture {arch!r} not supported by the demo — skipped')
+            continue
+        try:
+            files = fetch_run_files(mlflow, arch, run, inc)
+            stage_run(arch, run, files, os.path.join(runs_dir, rid), n_samples)
+            n_staged += 1
+        except Exception as exc:
+            print(f'[sync] {rid[:8]} FAILED: {exc}')
+    return n_staged
+
+
+def _now_ms():
+    import time
+    return int(time.time() * 1000)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--item2vec', action='append',

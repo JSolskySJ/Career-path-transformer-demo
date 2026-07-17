@@ -178,16 +178,25 @@ class Bert4RecModel:
             h = self.model.encoder(h, src_key_padding_mask=(ids_t == self.vocab.pad_id))
         return h[0, -1].numpy().copy(), used, unknown
 
-    def rank_titles(self, context: list, top_k: int = 10, allowed: set = None) -> dict:
-        """Rank titles by [MASK] softmax. ``allowed`` (optional set of W_TITLE
-        tokens) PROJECTS the softmax onto that subset — the logits are masked
-        to the allowed titles and renormalised, a true restricted-domain
-        prediction rather than a post-hoc filter."""
+    def rank_titles(self, context: list, top_k: int = 10, allowed: set = None,
+                    scoring: str = 'softmax') -> dict:
+        """Rank titles at the [MASK] position. ``allowed`` (optional set of
+        W_TITLE tokens) PROJECTS the ranking onto that subset — a true
+        restricted-domain prediction rather than a post-hoc filter.
+
+        ``scoring``:
+          'softmax' — dot-product logits through the tied head, softmax'd
+            (the training objective's view; norm-sensitive, so popular titles'
+            large-norm embeddings dominate).
+          'cosine'  — cosine between the [MASK] hidden state and the
+            L2-normalised title embeddings (the rare-title probe: removes the
+            norm/popularity component, item2vec-style; scores are similarities,
+            not probabilities)."""
         known   = [t for t in context if t in self.vocab.str2idx]
         unknown = [t for t in context if t not in self.vocab.str2idx]
         if not known:
             return {'predictions': [], 'used_tokens': [], 'unknown_tokens': unknown,
-                    'confidence': None, 'n_ranked': 0}
+                    'confidence': None, 'n_ranked': 0, 'scoring': scoring}
         used = known[-(self._max_len - 1):]
         ids  = self.vocab.encode(used)
         seq  = [self.vocab.pad_id] * (self._max_len - 1 - len(ids)) + ids + [self.vocab.mask_id]
@@ -198,8 +207,29 @@ class Bert4RecModel:
                     if t in allowed]
             if not keep:
                 return {'predictions': [], 'used_tokens': used, 'unknown_tokens': unknown,
-                        'confidence': None, 'n_ranked': 0}
+                        'confidence': None, 'n_ranked': 0, 'scoring': scoring}
             title_ids = torch.tensor(keep)
+
+        tid = title_ids.numpy()
+        if scoring == 'cosine':
+            ids_t = torch.tensor(seq).unsqueeze(0)
+            with torch.no_grad():
+                pos = torch.arange(ids_t.size(1))
+                h = self.model.dropout(self.model.norm(
+                    self.model.item_emb(ids_t) + self.model.pos_emb(pos)))
+                h = self.model.encoder(h, src_key_padding_mask=(ids_t == self.vocab.pad_id))
+                q = h[0, -1]
+                q = q / (q.norm() + 1e-9)
+                emb = self.model.item_emb.weight[title_ids]
+                emb = emb / (emb.norm(dim=1, keepdim=True) + 1e-9)
+                sims = (emb @ q).numpy()
+            order_local = np.argsort(-sims)[:top_k]
+            preds = [{'token': self.vocab.idx2str[tid[j]], 'score': float(sims[j])}
+                     for j in order_local]
+            return {'predictions': preds, 'used_tokens': used, 'unknown_tokens': unknown,
+                    'confidence': distribution_confidence(sims, 'cosine'),
+                    'n_ranked': len(title_ids), 'scoring': scoring}
+
         title_mask = torch.zeros(self.vocab.size, dtype=torch.bool)
         title_mask[title_ids] = True
         with torch.no_grad():
@@ -209,11 +239,10 @@ class Bert4RecModel:
 
         # Order over the (possibly projected) title ids only — a full-vocab
         # argsort would let zero-prob masked entries pad out a small domain.
-        tid = title_ids.numpy()
         order = tid[np.argsort(-probs[tid])][:top_k]
         preds = [{'token': self.vocab.idx2str[i], 'score': float(probs[i])} for i in order]
         # Confidence over the (possibly projected) domain — probs sum to 1 there.
         title_probs = probs[tid]
         return {'predictions': preds, 'used_tokens': used, 'unknown_tokens': unknown,
                 'confidence': distribution_confidence(title_probs, 'prob'),
-                'n_ranked': len(title_ids)}
+                'n_ranked': len(title_ids), 'scoring': scoring}

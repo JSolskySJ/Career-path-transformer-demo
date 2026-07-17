@@ -23,8 +23,15 @@
   .inspector .heatmap { width: 100%; }
   .inspector details.mask-weights { margin: 2px 0 14px; font-size: 12.5px; }
   .inspector details.mask-weights summary { cursor: pointer; color: var(--accent); }
-  .inspector .contrib-row .tok { max-width: 420px; }
-  .inspector .contrib-row .bar-wrap { max-width: 500px; }
+  /* Fixed columns so every row's bars and numbers line up: token label |
+     bars (flex) | score. Variable-width labels were skewing the bars. */
+  .inspector .contrib-row .tok {
+    flex: 0 0 300px;
+    max-width: 300px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .inspector .contrib-row .bar-wrap { flex: 1; max-width: 500px; }
   .inspector .err { color: #b91c1c; }
   .inspector h4 { font-size: 12.5px; margin: 10px 0 2px; color: var(--ink); }
   .inspector details.flow-details { margin: 4px 0 10px; }
@@ -36,10 +43,25 @@
     margin-top: 6px;
   }
   .inspector .weights-grid .hint { margin: 0 0 2px; }
-  .inspector .bar-pair { flex: 1; display: flex; flex-direction: column; gap: 2px; max-width: 500px; }
-  .inspector .bar-pair .bar-wrap { max-width: none; }
+  .inspector .bar-pair { flex: 1 0 0; display: flex; flex-direction: column; gap: 2px; max-width: 500px; }
+  .inspector .bar-pair .bar-wrap { flex: none; width: 100%; max-width: none; }
   .inspector .contrib-row .bar.vw { background: #b91c1c; }
-  .inspector .contrib-row .score { width: 110px; }
+  /* Centre-zero signed bars for the leave-one-out influence */
+  .inspector .bar-wrap.center { position: relative; height: 10px; }
+  .inspector .bar-wrap.center::before {
+    content: '';
+    position: absolute;
+    left: 50%; top: -1px; bottom: -1px;
+    border-left: 1px solid var(--muted);
+  }
+  .inspector .bar-wrap.center .bar { position: absolute; top: 1.5px; height: 7px; }
+  .inspector .bar-wrap.center .bar.pos { left: 50%; background: #059669; }
+  .inspector .bar-wrap.center .bar.neg { right: 50%; background: #b91c1c; }
+  .inspector .contrib-row .score {
+    flex: 0 0 110px;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
 </style>
 </head>
 <body>
@@ -180,6 +202,30 @@ function renderBert4rec(data) {
           <th>top titles at this depth</th></tr>
       ${lensRows}
     </table>`;
+
+  // ── 0 · Per-token influence on THIS title (leave-one-out) ───────────────
+  if (data.ablation) {
+    const ab = data.ablation;
+    const infl = section(box, `0 · Per-token influence on “${short(data.title)}”`,
+      `leave-one-out: the model is re-run with each token removed; the bar is the
+       resulting change in this title's logit (green = the token pushes the
+       prediction TOWARD the title, red = away). Numbers: Δlogit · Δprobability.
+       Baseline logit ${ab.base_logit.toFixed(3)}${ab.base_prob !== null
+         ? `, in-domain prob ${(ab.base_prob * 100).toFixed(2)}%` : ''}.`);
+    const maxAbs = Math.max(1e-9, ...ab.tokens.map(t => Math.abs(t.delta_logit)));
+    const order = [...ab.tokens].sort((a, b) => b.delta_logit - a.delta_logit);
+    infl.innerHTML = order.map(t => `
+      <div class="contrib-row">
+        <span class="tok ${data.token_types[t.i]}">${fullTokens[t.i]}</span>
+        <span class="bar-wrap center">
+          <span class="bar ${t.delta_logit >= 0 ? 'pos' : 'neg'}"
+            style="width:${Math.max(1, 50 * Math.abs(t.delta_logit) / maxAbs)}%"></span>
+        </span>
+        <span class="score">${t.delta_logit >= 0 ? '+' : ''}${t.delta_logit.toFixed(3)}
+          ${t.delta_prob !== null
+            ? ` · ${t.delta_prob >= 0 ? '+' : ''}${(t.delta_prob * 100).toFixed(2)}pp` : ''}</span>
+      </div>`).join('');
+  }
 
   // ── 1 · Input embeddings ─────────────────────────────────────────────────
   const emb = section(box, '1 · Input embeddings',

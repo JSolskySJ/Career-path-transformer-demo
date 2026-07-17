@@ -46,6 +46,15 @@
           <option value="work_only">Work only</option>
           <option value="education_only">Education only</option>
         </select>
+        <select id="sample-repeats"
+                title="Filter resumes by title repetition (target included):
+                pick clean resumes to see model performance without repeat-copy
+                inflation, or repeat-heavy ones to study it">
+          <option value="">Any repetition</option>
+          <option value="no-consecutive">No consecutive repeats</option>
+          <option value="no-repeats">No repeated titles at all</option>
+          <option value="has-repeats">Only with repeats</option>
+        </select>
         <input id="sample-search" type="text" placeholder="Search samples…">
       </div>
       <div id="sample-list" class="sample-list"></div>
@@ -81,6 +90,29 @@
           <option value="all">model default</option>
           <option value="sj">SJ titles only</option>
           <option value="taxonomy">taxonomy titles only</option>
+        </select>
+      </label>
+      <label title="bert4rec scoring rule — 'softmax' is the trained head (dot-product
+             logits; popular titles' large-norm embeddings dominate); 'cosine' scores the
+             [MASK] hidden state against L2-normalised title embeddings, removing the
+             norm/popularity component (the rare-title probe, item2vec-style). item2vec
+             models are cosine-native and ignore this">
+        Scoring
+        <select id="rank-scoring">
+          <option value="softmax">softmax (trained head)</option>
+          <option value="cosine">cosine (rare-title probe)</option>
+        </select>
+      </label>
+      <label title="Roll repeated job titles up before predicting: 'consecutive'
+             merges adjacent same-title experiences (the training-side collapse);
+             'all repeats' drops every re-occurrence of a title so the model can't
+             lean on repeat-copying. Applied to the model input — the token
+             preview, inspector and space plot show the rolled-up sequence.">
+        Title rollup
+        <select id="rollup-mode">
+          <option value="none">no rollup</option>
+          <option value="consecutive">consecutive repeats</option>
+          <option value="all">all repeats</option>
         </select>
       </label>
       <button id="predict-btn" class="primary" disabled>Predict next role</button>

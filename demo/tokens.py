@@ -195,6 +195,39 @@ def bundle_kind(bundle: list) -> str:
     return _token_kind(token_type(bundle[0]))
 
 
+def rollup_titles(tokens: list, mode: str) -> list:
+    """Job-title rollup — drop WORK bundles whose W_TITLE repeats, taking the
+    bundle's companion tokens (duration/role/company/…) with it.
+
+      'consecutive' — drop a work bundle when its title equals the immediately
+                      preceding WORK bundle's title (an education bundle in
+                      between resets adjacency — matching the training-side
+                      collapse_consecutive_titles semantics).
+      'all'         — drop a work bundle when its title appeared in ANY earlier
+                      work bundle.
+      anything else — no-op.
+
+    The demo keeps the FIRST occurrence's bundle intact (no tenure summing —
+    the dropped bundle's W_DURATION simply goes with it)."""
+    if mode not in ('consecutive', 'all'):
+        return list(tokens)
+    out, seen, prev = [], set(), None
+    for bundle in group_token_bundles(tokens):
+        if bundle_kind(bundle) == 'WORK':
+            title = next((t for t in bundle if t.startswith(W_TITLE_PREFIX)), None)
+            if title is not None:
+                if mode == 'consecutive' and title == prev:
+                    continue
+                if mode == 'all' and title in seen:
+                    continue
+                seen.add(title)
+            prev = title
+        else:
+            prev = None          # non-work bundle breaks adjacency
+        out.extend(bundle)
+    return out
+
+
 def _self_check():
     """Smallest checks that fail if bundling / skills-prepending breaks."""
     seq = ['S_SKILL:welding', 'S_SKILL:forklift',
@@ -215,6 +248,16 @@ def _self_check():
     assert rebuilt[:2] == ['S_SKILL:welding', 'S_SKILL:forklift'], rebuilt
     assert rebuilt[2:] == ['W_TITLE:engineer', 'W_DURATION:1-2y', 'W_ROLE:engineering',
                            'W_COMPANY:acme', 'W_SPEC:welding', 'W_SPEC:pipes'], rebuilt
+    # rollup: A A B A → consecutive drops the adjacent A; all drops both repeats
+    rep = ['W_TITLE:a', 'W_DURATION:1-2y', 'W_TITLE:a', 'W_TITLE:b', 'W_TITLE:a']
+    assert rollup_titles(rep, 'consecutive') == \
+        ['W_TITLE:a', 'W_DURATION:1-2y', 'W_TITLE:b', 'W_TITLE:a'], rollup_titles(rep, 'consecutive')
+    assert rollup_titles(rep, 'all') == \
+        ['W_TITLE:a', 'W_DURATION:1-2y', 'W_TITLE:b'], rollup_titles(rep, 'all')
+    # an education bundle between identical titles resets adjacency (consecutive keeps)
+    gap = ['W_TITLE:a', 'E_MAJOR:x', 'W_TITLE:a']
+    assert rollup_titles(gap, 'consecutive') == gap, rollup_titles(gap, 'consecutive')
+    assert rollup_titles(gap, 'all') == ['W_TITLE:a', 'E_MAJOR:x'], rollup_titles(gap, 'all')
     print('tokens self-check: OK')
 
 
