@@ -47,17 +47,40 @@ PAD_TOKEN, MASK_TOKEN = '[PAD]', '[MASK]'
 
 
 def _load_bert4rec_module(pth):
-    """Unpickle the mlflow-logged BERT4Rec nn.Module, shimming its original
-    training module path onto the demo's identical class."""
+    """Unpickle an mlflow-logged torch career-path module (BERT4Rec or its
+    DenseRec extension), shimming the original training module paths onto the
+    demo's weight-compatible classes."""
     import torch
     import demo.bert4rec_model as b4
+    import demo.denserec_model as dr
+    import demo.modernbert_model as mb
 
-    pkg = types.ModuleType('models'); pkg.__path__ = []
-    sys.modules['models'] = pkg
-    shim = types.ModuleType('models.career_path_transformer_bert4rec')
-    shim.BERT4Rec = b4.BERT4Rec
-    sys.modules['models.career_path_transformer_bert4rec'] = shim
-    return torch.load(pth, map_location='cpu', weights_only=False).eval()
+    # The shim must not permanently shadow a real `models` package (e.g. the
+    # datawarehouse-ai one used by demo.dataset_samples in the same process) —
+    # save whatever is loaded and restore it after unpickling.
+    saved = {k: sys.modules[k] for k in list(sys.modules)
+             if k == 'models' or k.startswith('models.')}
+    try:
+        pkg = types.ModuleType('models'); pkg.__path__ = []
+        sys.modules['models'] = pkg
+        shim = types.ModuleType('models.career_path_transformer_bert4rec')
+        shim.BERT4Rec = b4.BERT4Rec
+        sys.modules['models.career_path_transformer_bert4rec'] = shim
+        dshim = types.ModuleType('models.career_path_transformer_denserec')
+        dshim.DenseRecBERT4Rec = dr.DenseRecBERT4Rec
+        dshim.DenseRecModernBERT4Rec = dr.DenseRecModernBERT4Rec
+        sys.modules['models.career_path_transformer_denserec'] = dshim
+        mshim = types.ModuleType('models.career_path_transformer_modernbert')
+        mshim.ModernBERT4Rec = mb.ModernBERT4Rec
+        mshim.RotaryEmbedding = mb.RotaryEmbedding
+        mshim.ModernBertBlock = mb.ModernBertBlock
+        sys.modules['models.career_path_transformer_modernbert'] = mshim
+        return torch.load(pth, map_location='cpu', weights_only=False).eval()
+    finally:
+        for k in list(sys.modules):
+            if k == 'models' or k.startswith('models.'):
+                del sys.modules[k]
+        sys.modules.update(saved)
 
 
 def _logged_idx2str(vocab_json_candidates, vocab_size):
@@ -88,8 +111,15 @@ def stage_bert4rec(pth, vocab_json_candidates, vocab_csvs, out_dir):
     d_model = sd['item_emb.weight'].shape[1]
     vocab_size = sd['item_emb.weight'].shape[0]
     max_len = sd['pos_emb.weight'].shape[0]
-    n_layers = len({k.split('.')[2] for k in sd if k.startswith('encoder.layers.')})
-    n_heads = model.encoder.layers[0].self_attn.num_heads
+    # backbone detection: ModernBERT blocks live at encoder.{i}.* with a
+    # final_norm; the stock stack at encoder.layers.{i}.*
+    modern = 'final_norm.weight' in sd
+    if modern:
+        n_layers = len({k.split('.')[1] for k in sd if k.startswith('encoder.')})
+        n_heads = model.encoder[0].n_heads
+    else:
+        n_layers = len({k.split('.')[2] for k in sd if k.startswith('encoder.layers.')})
+        n_heads = model.encoder.layers[0].self_attn.num_heads
 
     matching_csv = next(
         (c for c in sorted(vocab_csvs, key=os.path.getmtime, reverse=True)
@@ -110,15 +140,26 @@ def stage_bert4rec(pth, vocab_json_candidates, vocab_csvs, out_dir):
     torch.save({k: t.cpu() for k, t in sd.items()}, os.path.join(out_dir, 'model.pt'))
     with open(os.path.join(out_dir, 'vocab.json'), 'w') as f:
         json.dump(idx2str, f)
+    cfg = {
+        'd_model': int(d_model), 'n_layers': int(n_layers), 'n_heads': int(n_heads),
+        'max_len': int(max_len), 'dropout': 0.2,
+        'vocab_size': int(vocab_size),
+        'backbone': 'modernbert' if modern else 'bert4rec',
+        'source': os.path.basename(pth), 'origin': 'mlflow',
+    }
+    arch = 'modernbert' if modern else 'bert4rec'
+    if 'content' in sd:                    # DenseRec extension buffers present
+        arch = 'denserec'
+        cfg.update({
+            'content_dim': int(sd['content'].shape[1]),
+            'dense_path_p': float(getattr(model, 'dense_path_p', 0.5)),
+        })
+    cfg['architecture'] = arch
     with open(os.path.join(out_dir, 'config.json'), 'w') as f:
-        json.dump({
-            'd_model': int(d_model), 'n_layers': int(n_layers), 'n_heads': int(n_heads),
-            'max_len': int(max_len), 'dropout': 0.2,
-            'vocab_size': int(vocab_size),
-            'source': os.path.basename(pth), 'origin': 'mlflow',
-        }, f, indent=2)
-    print(f'bert4rec: vocab_size={vocab_size} d_model={d_model} '
-          f'max_len={max_len} n_layers={n_layers} n_heads={n_heads} -> {out_dir}')
+        json.dump(cfg, f, indent=2)
+    print(f'{arch} ({cfg["backbone"]} backbone): vocab_size={vocab_size} '
+          f'd_model={d_model} max_len={max_len} n_layers={n_layers} '
+          f'n_heads={n_heads} -> {out_dir}')
     return matching_csv
 
 

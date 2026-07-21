@@ -391,6 +391,12 @@ table.kv td:first-child { color: var(--muted); font-family: ui-monospace, Menlo,
 .entry.work .badge { color: var(--work); }
 .entry.education .badge { color: var(--edu); }
 .entry.skills .badge { color: var(--skill); }
+.builder-target {
+  padding: 5px 9px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  background: #fafbfd;
+}
 .entry .fields { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .entry .fields .field { position: relative; }
 .entry input { width: 100%; }

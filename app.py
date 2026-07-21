@@ -286,7 +286,7 @@ def predict():
 
 
 @app.route('/api/inspect', methods=['POST'])
-def inspect():
+def inspect_endpoint():   # named to avoid shadowing the stdlib `inspect` module
     """Drill-down for one (model, resume, title): bert4rec logit lens +
     per-layer/head attention matrices; item2vec per-token cosine pull."""
     payload = request.get_json(force=True)

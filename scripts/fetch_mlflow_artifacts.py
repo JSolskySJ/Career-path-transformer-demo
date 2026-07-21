@@ -52,13 +52,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from demo import config
 
 EXPERIMENT = '{partner}_career_path_transformer'
-ARCHITECTURES = ('item2vec', 'bert4rec')
+ARCHITECTURES = ('item2vec', 'bert4rec', 'denserec', 'modernbert')
 PREDICTIONS_RE = re.compile(r'^career_path_transformer_\d{8}_\d{6}\.csv$')
 VOCAB_CSV_RE = re.compile(r'^career_path_transformer_vocab_\d{8}_\d{6}\.csv$')
-# Files this script manages inside incoming/ — cleared before each fetch so
-# staging never mixes artifacts from different fetches.
-MANAGED_GLOBS = ('career_path_transformer_*.csv', 'career_path_transformer_*.bin*',
-                 'model*.pth', 'bert4rec_vocab*.json', 'RUN_INFO.json')
+# incoming/ is a persistent download cache: files are per-run named (model_
+# <rid>.pth, bert4rec_vocab_<rid>.json, timestamped CSVs/bins) so fetches
+# never mix runs and nothing is downloaded twice.
 
 
 def connect(env, ai_conf):
@@ -150,18 +149,28 @@ def _http_download(url, dst, expected_size=None, attempts=30):
     raise RuntimeError(f'download failed after {attempts} attempts: {url}')
 
 
-def _run_artifact_http_url(mlflow, run, artifact_path) -> str:
-    """Map a run's mlflow-artifacts:/ URI to the tracking server's HTTP
-    artifact endpoint for one file."""
-    root = run.info.artifact_uri  # e.g. mlflow-artifacts:/51/<run_id>/artifacts
+def _artifact_http_url(mlflow, root, artifact_path) -> str:
+    """Map an mlflow-artifacts:/ URI to the tracking server's HTTP artifact
+    endpoint for one file."""
     base = mlflow.get_tracking_uri().rstrip('/')
     return root.replace('mlflow-artifacts:/', f'{base}/api/2.0/mlflow-artifacts/artifacts/') \
         + f'/{artifact_path}'
 
 
+def _run_artifact_http_url(mlflow, run, artifact_path) -> str:
+    return _artifact_http_url(mlflow, run.info.artifact_uri, artifact_path)
+
+
+def _cached(dst, size=None) -> bool:
+    """True when dst already holds a complete previous download — incoming/ is
+    a persistent cache, so nothing is ever pulled twice. Size-checked when the
+    remote size is known; a size-0 remote entry falls back to existence."""
+    return os.path.exists(dst) and (not size or os.path.getsize(dst) == size)
+
+
 def _find_artifacts(repo, pattern) -> list:
     """BFS an artifact repository for all files matching pattern; returns
-    their repo-relative paths."""
+    (repo-relative path, file size) tuples."""
     import fnmatch
     hits, queue = [], [None]
     while queue:
@@ -169,7 +178,7 @@ def _find_artifacts(repo, pattern) -> list:
             if a.is_dir:
                 queue.append(a.path)
             elif fnmatch.fnmatch(os.path.basename(a.path), pattern):
-                hits.append(a.path)
+                hits.append((a.path, a.file_size))
     return hits
 
 
@@ -185,33 +194,41 @@ def fetch_run_files(mlflow, arch, run, inc) -> dict:
     for a in mlflow.artifacts.list_artifacts(run_id=rid):
         base = os.path.basename(a.path)
         if PREDICTIONS_RE.match(base) or VOCAB_CSV_RE.match(base):
-            # CSVs are nice-to-have (samples/transitions) — don't let one flaky
-            # transfer kill the fetch of the model itself. Fall back to a raw
-            # resumable GET when the MLflow client keeps dropping the transfer.
-            try:
-                local = _retry(lambda p=a.path: mlflow.artifacts.download_artifacts(
-                    run_id=rid, artifact_path=p, dst_path=inc), attempts=3, label=base)
-            except Exception:
+            dst = os.path.join(inc, base)
+            if _cached(dst, a.file_size):
+                print(f'  {base}  (cached)')
+                local = dst
+            else:
+                # CSVs are nice-to-have (samples/transitions) — don't let one
+                # flaky transfer kill the fetch of the model itself. Fall back
+                # to a raw resumable GET when the MLflow client keeps dropping.
                 try:
-                    print(f'  {base}: MLflow client failed — raw HTTP fallback')
-                    local = _http_download(_run_artifact_http_url(mlflow, run, a.path),
-                                           os.path.join(inc, base), a.file_size)
-                except Exception as exc:
-                    print(f'  WARNING: giving up on {base}: {exc}')
-                    continue
-            print(f'  {base}  ({a.file_size or 0:,} bytes)')
+                    local = _retry(lambda p=a.path: mlflow.artifacts.download_artifacts(
+                        run_id=rid, artifact_path=p, dst_path=inc), attempts=3, label=base)
+                except Exception:
+                    try:
+                        print(f'  {base}: MLflow client failed — raw HTTP fallback')
+                        local = _http_download(_run_artifact_http_url(mlflow, run, a.path),
+                                               dst, a.file_size)
+                    except Exception as exc:
+                        print(f'  WARNING: giving up on {base}: {exc}')
+                        continue
+                print(f'  {base}  ({a.file_size or 0:,} bytes)')
             if PREDICTIONS_RE.match(base):
                 files['predictions'].append(local)
             else:
                 files['vocab_csv'] = local
-        elif arch == 'bert4rec' and base == 'vocab.json':
-            local = _retry(lambda p=a.path: mlflow.artifacts.download_artifacts(
-                run_id=rid, artifact_path=p, dst_path=inc), label=base)
-            # per-run name — two bert4rec runs in one fetch must not collide
+        elif arch in ('bert4rec', 'denserec', 'modernbert') and base == 'vocab.json':
+            # per-run name — two runs in one fetch must not collide
             dst = os.path.join(inc, f'bert4rec_vocab_{rid[:8]}.json')
-            shutil.move(local, dst)
+            if _cached(dst, a.file_size):
+                print(f'  {os.path.basename(dst)}  (cached)')
+            else:
+                local = _retry(lambda p=a.path: mlflow.artifacts.download_artifacts(
+                    run_id=rid, artifact_path=p, dst_path=inc), label=base)
+                shutil.move(local, dst)
+                print(f'  vocab.json -> {os.path.basename(dst)} (authoritative idx2str)')
             files['vocab_json'] = dst
-            print(f'  vocab.json -> {os.path.basename(dst)} (authoritative idx2str)')
 
     # The model binary lives under the run's logged model (older runs) OR
     # directly under the run's own artifact tree (newer runs log the model as a
@@ -231,29 +248,57 @@ def fetch_run_files(mlflow, arch, run, inc) -> dict:
     pattern = '*.bin*' if arch == 'item2vec' else '*.pth'
     if named:
         source = f'logged model {named[0].model_id}'
-        repo = get_artifact_repository(mlflow.get_logged_model(named[0].model_id).artifact_location)
+        repo_root = mlflow.get_logged_model(named[0].model_id).artifact_location
     else:
         source = 'run artifacts'
-        repo = get_artifact_repository(run.info.artifact_uri)
+        repo_root = run.info.artifact_uri
+    repo = get_artifact_repository(repo_root)
     paths = _find_artifacts(repo, pattern)
     if not paths:
         print(f'  WARNING: no {pattern} in {source} for run {rid} — model binary skipped')
         return files
     tmp = os.path.join(inc, f'_model_{arch}')
     os.makedirs(tmp, exist_ok=True)
-    for path in paths:
-        local = _retry(lambda p=path: repo.download_artifacts(p, tmp),
-                       label=os.path.basename(path))
-        base = os.path.basename(local)
+    for path, size in paths:
+        base = os.path.basename(path)
         if base == 'model.pth':                       # per-run name (see vocab.json)
             base = f'model_{rid[:8]}.pth'
         dst = os.path.join(inc, base)
-        shutil.move(local, dst)
+        if _cached(dst, size):
+            print(f'  {base}  (cached)')
+        else:
+            try:
+                local = _retry(lambda p=path: repo.download_artifacts(p, tmp),
+                               attempts=3, label=os.path.basename(path))
+                shutil.move(local, dst)
+            except Exception:
+                # flaky server: fall back to the resumable raw GET — combined
+                # with the cache, an interrupted download continues where it
+                # stopped instead of starting over
+                print(f'  {base}: MLflow client failed — raw HTTP fallback')
+                _http_download(_artifact_http_url(mlflow, repo_root, path), dst, size)
+            print(f'  {base}  ({source})')
         if dst.endswith(('.bin', '.pth')):
             files['model_file'] = dst
-        print(f'  {base}  ({source})')
     shutil.rmtree(tmp, ignore_errors=True)
     return files
+
+
+def _write_run_json(arch, run, run_dir):
+    """Params + headline metrics for the UI's run-properties / model-info views."""
+    os.makedirs(run_dir, exist_ok=True)
+    metrics = {k: v for k, v in run.data.metrics.items()
+               if not k.startswith(('track_', 'finetune_track_'))}
+    with open(os.path.join(run_dir, 'run.json'), 'w') as f:
+        json.dump({
+            'run_id': run.info.run_id,
+            'run_name': run.data.tags.get('mlflow.runName'),
+            'run_tag': run.data.tags.get('run_tag'),
+            'architecture': arch,
+            'start_time': str(run.info.start_time),
+            'params': dict(run.data.params),
+            'metrics': metrics,
+        }, f, indent=2)
 
 
 def stage_run(arch, run, files, run_dir, n_samples):
@@ -266,11 +311,12 @@ def stage_run(arch, run, files, run_dir, n_samples):
 
     if files['model_file'] is None:
         print(f'  [{arch} {rid[:8]}] no model binary — run NOT staged as a model')
-    elif arch == 'bert4rec':
+    elif arch in ('bert4rec', 'denserec', 'modernbert'):
+        # denserec/modernbert are BERT4Rec extensions — same staging path, arch-named dir
         staging.stage_bert4rec(files['model_file'],
                                [files['vocab_json']] if files['vocab_json'] else [],
                                [files['vocab_csv']] if files['vocab_csv'] else [],
-                               os.path.join(run_dir, 'bert4rec'))
+                               os.path.join(run_dir, arch))
     else:
         staging.stage_item2vec(files['model_file'], run_dir)
 
@@ -279,19 +325,7 @@ def stage_run(arch, run, files, run_dir, n_samples):
         vocab_csv = os.path.join(run_dir, 'vocab.csv')
         shutil.copy(files['vocab_csv'], vocab_csv)
 
-    # Params + headline metrics for the UI's run-properties / model-info views.
-    metrics = {k: v for k, v in run.data.metrics.items()
-               if not k.startswith(('track_', 'finetune_track_'))}
-    with open(os.path.join(run_dir, 'run.json'), 'w') as f:
-        json.dump({
-            'run_id': rid,
-            'run_name': run.data.tags.get('mlflow.runName'),
-            'run_tag': run.data.tags.get('run_tag'),
-            'architecture': arch,
-            'start_time': str(run.info.start_time),
-            'params': dict(run.data.params),
-            'metrics': metrics,
-        }, f, indent=2)
+    _write_run_json(arch, run, run_dir)
 
     if files['predictions']:
         csv = max(files['predictions'], key=os.path.getsize)
@@ -346,15 +380,25 @@ def sync_new_runs(env='test-prod-sj', ai_conf=None, n_samples=300, max_runs=25):
         run = client.get_run(rid)
         arch = run.data.tags.get('architecture')
         if arch not in ARCHITECTURES:
+            # Metadata-only staging: the run shows up in the dropdown/compare
+            # table (params + metrics) marked "not displayable" — no model pull.
             print(f'[sync] {rid[:8]} ({run.data.tags.get("mlflow.runName")}): '
-                  f'architecture {arch!r} not supported by the demo — skipped')
+                  f'architecture {arch!r} not displayable — staging metadata only')
+            _write_run_json(arch or 'unknown', run, os.path.join(runs_dir, rid))
+            n_staged += 1
             continue
         try:
             files = fetch_run_files(mlflow, arch, run, inc)
             stage_run(arch, run, files, os.path.join(runs_dir, rid), n_samples)
             n_staged += 1
         except Exception as exc:
-            print(f'[sync] {rid[:8]} FAILED: {exc}')
+            # Stage metadata anyway: the run shows up as unavailable AND is
+            # never auto-retried on every boot (the failed download would
+            # otherwise waste minutes at each start). Re-fetch manually or via
+            # the backfill script once the server behaves.
+            print(f'[sync] {rid[:8]} FAILED ({exc}) — staged metadata only; '
+                  f'model download will NOT be retried automatically')
+            _write_run_json(arch, run, os.path.join(runs_dir, rid))
     return n_staged
 
 
@@ -389,9 +433,9 @@ def main():
 
     inc = os.path.join(config.DEMO_ROOT, 'incoming')
     os.makedirs(inc, exist_ok=True)
-    for pattern in MANAGED_GLOBS:
-        for f in glob.glob(os.path.join(inc, pattern)):
-            os.remove(f)
+    # incoming/ is a persistent download cache (files are per-run named, so
+    # fetches can't mix runs) — only stale temp dirs are cleared. Delete files
+    # manually to force a re-download.
     for d in glob.glob(os.path.join(inc, '_model_*')):
         shutil.rmtree(d, ignore_errors=True)
 

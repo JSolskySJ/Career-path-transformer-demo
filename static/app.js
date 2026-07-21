@@ -5,6 +5,7 @@ const state = {
   selectedSample: null,
   entries: [],            // builder entries
   entrySeq: 0,
+  builderTarget: null,    // held-out target carried over from an edited sample
   activeTab: 'samples',
   lastPrediction: null,
   runs: {},               // run_id -> /api/status model entry
@@ -34,21 +35,26 @@ const FIELD_SPECS = {
     ['subrole',  'W_SUBROLE',  'Sub-role (e.g. software)'],
     ['industry', 'W_INDUSTRY', 'Industry'],
     ['company',  'W_COMPANY',  'Company'],
-    ['spec',     'W_SPEC',     'Specialisations (comma-separated)'],
+    ['spec',     'W_SPEC',     'Specialisations (separate with |)'],
+    ['description', 'W_DESC',  'Job description (freetext — DenseRec-only, injected via MiniLM)'],
   ],
   EDUCATION: [
-    ['major',       'E_MAJOR',  'Major (e.g. computer science)'],
+    ['major',       'E_MAJOR',  'Major(s) (separate with |)'],
     ['degree',      'E_DEGREE', 'Degree (e.g. bachelors)'],
     ['school_type', 'E_TYPE',   'School type'],
     ['level',       'E_LEVEL',  'Education level'],
   ],
   SKILLS: [
-    ['skills', 'S_SKILL', 'Skills (comma-separated, e.g. forklift, welding)'],
+    ['skills', 'S_SKILL', 'Skills (separate with |, e.g. forklift | welding)'],
   ],
 };
 
-// Comma-separated multi-value fields → one token per value.
-const MULTI_FIELDS = new Set(['spec', 'skills']);
+// Multi-value fields → one token per value. '|' is the ONLY separator (real
+// values routinely contain commas, so commas stay literal).
+const MULTI_FIELDS = new Set(['spec', 'skills', 'major']);
+function splitMultiValue(v) {
+  return (v || '').split('|');
+}
 
 /* ── Token building (mirrors demo/tokens.py) ────────────────────────────── */
 
@@ -58,9 +64,12 @@ function tokensFromEntry(e) {
   const out = [];
   for (const [field, prefix] of FIELD_SPECS[e.type]) {
     const values = MULTI_FIELDS.has(field)
-      ? (e.values[field] || '').split(',') : [e.values[field]];
+      ? splitMultiValue(e.values[field]) : [e.values[field]];
     for (const raw of values) {
-      const v = norm(raw);
+      // descriptions are kept verbatim (case AND whitespace — a stored value
+      // can legitimately end in a space after training's strip-then-truncate)
+      const v = field === 'description'
+        ? ((raw || '').trim() ? raw : '') : norm(raw);
       if (v && !out.includes(`${prefix}:${v}`)) out.push(`${prefix}:${v}`);
     }
   }
@@ -83,8 +92,30 @@ function currentTokens() {
 }
 
 function currentTarget() {
-  return (state.activeTab === 'samples' && state.selectedSample)
-    ? state.selectedSample.target : null;
+  if (state.activeTab === 'samples') {
+    return state.selectedSample ? state.selectedSample.target : null;
+  }
+  // Builder: an edited sample keeps its held-out target, so token edits show
+  // how the actual answer's rank moves.
+  return state.builderTarget;
+}
+
+// Load the selected sample's experiences into the builder for token editing —
+// every field (title, description, skills, …) becomes editable, and the
+// held-out target rides along for the sense check.
+function editSelectedSample() {
+  const s = state.selectedSample;
+  if (!s) return;
+  const fields = new Set(Object.values(FIELD_SPECS).flat().map(([f]) => f));
+  state.entries = s.experiences.map(exp => ({
+    id: ++state.entrySeq,
+    type: exp.type,
+    values: Object.fromEntries(Object.entries(exp)
+      .filter(([k, v]) => k !== 'type' && fields.has(k) && v)),
+  }));
+  state.builderTarget = s.target;
+  renderBuilder();
+  document.querySelector('.tab[data-tab="builder"]').click();
 }
 
 /* ── Status ─────────────────────────────────────────────────────────────── */
@@ -411,6 +442,19 @@ function addEntry(type) {
 function renderBuilder() {
   const box = $('#builder-entries');
   box.innerHTML = '';
+  if (state.builderTarget) {
+    const chip = document.createElement('p');
+    chip.className = 'hint builder-target';
+    chip.innerHTML = `Editing against held-out target:
+      <b>${state.builderTarget.replace('W_TITLE:', '')}</b>
+      <button class="icon" title="Drop the target (rank check disappears)">✕</button>`;
+    chip.querySelector('button').onclick = () => {
+      state.builderTarget = null;
+      renderBuilder();
+      onResumeChanged();
+    };
+    box.appendChild(chip);
+  }
   state.entries.forEach((entry, i) => {
     const div = document.createElement('div');
     div.className = 'entry ' + entry.type.toLowerCase();
@@ -473,9 +517,9 @@ function removeEntry(i) {
 let acTimer = null;
 function autocomplete(input, wrap, prefix, entry, field) {
   clearTimeout(acTimer);
-  // Multi-value fields autocomplete the segment after the last comma.
+  // Multi-value fields autocomplete the segment after the last separator.
   const multi = MULTI_FIELDS.has(field);
-  const parts = multi ? input.value.split(',') : [input.value];
+  const parts = multi ? input.value.split('|') : [input.value];
   const q = norm(parts[parts.length - 1]);
   if (!q) { clearSuggestions(wrap); return; }
   acTimer = setTimeout(async () => {
@@ -489,7 +533,7 @@ function autocomplete(input, wrap, prefix, entry, field) {
       const item = document.createElement('div');
       item.textContent = v;
       item.onmousedown = () => {
-        const next = multi ? [...parts.slice(0, -1), ` ${v}`].join(',').replace(/^ /, '') : v;
+        const next = multi ? [...parts.slice(0, -1), ` ${v}`].join('|').replace(/^ /, '') : v;
         entry.values[field] = next;
         input.value = next;
         clearSuggestions(wrap);
@@ -509,7 +553,7 @@ function clearSuggestions(wrap) {
 
 // Repeated fields (skills, specs, double majors) arrive comma-joined.
 function splitMulti(v) {
-  return (v || '').split(',').map(s => s.trim()).filter(Boolean);
+  return splitMultiValue(v).map(s => s.trim()).filter(Boolean);
 }
 
 function chipRow(values, cls) {
@@ -563,6 +607,15 @@ function renderResumeView() {
   t.className = 'hint';
   t.innerHTML = `Actual next role (held out): <b>${state.selectedSample.target.replace('W_TITLE:', '')}</b>`;
   box.appendChild(t);
+
+  const edit = document.createElement('button');
+  edit.className = 'ghost';
+  edit.textContent = '✎ Edit tokens';
+  edit.title = 'Open this resume in the builder — change any token (title, ' +
+               'description, skills, …) and re-predict to see what the model ' +
+               'is relying on. The held-out target rides along for the sense check.';
+  edit.onclick = editSelectedSample;
+  box.appendChild(edit);
 }
 
 function renderTokenPreview(oov = [], tokensOverride = null) {
@@ -676,6 +729,11 @@ function renderPredictions() {
           <span class="score">${p.score.toFixed(4)}</span>
         </div>`;
     });
+    if (r.injected_tokens && r.injected_tokens.length) {
+      html += `<p class="hint" title="${r.injected_tokens.join(', ')}">
+        ✚ DenseRec injected ${r.injected_tokens.length} unseen token(s) via the
+        content path (MiniLM) instead of dropping them</p>`;
+    }
     if (r.unknown_tokens && r.unknown_tokens.length) {
       html += `<p class="warn">Ignored ${r.unknown_tokens.length} out-of-vocabulary token(s)</p>`;
     }

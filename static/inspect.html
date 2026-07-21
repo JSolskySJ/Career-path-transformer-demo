@@ -33,6 +33,16 @@
   }
   .inspector .contrib-row .bar-wrap { flex: 1; max-width: 500px; }
   .inspector .err { color: #b91c1c; }
+  .inspector .not-displayable {
+    max-width: 560px;
+    margin: 60px auto;
+    text-align: center;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 28px;
+    background: #fafbfd;
+  }
+  .inspector .not-displayable h2 { margin-top: 0; }
   .inspector h4 { font-size: 12.5px; margin: 10px 0 2px; color: var(--ink); }
   .inspector details.flow-details { margin: 4px 0 10px; }
   .inspector details.flow-details > summary { cursor: pointer; color: var(--accent); font-size: 12.5px; }
@@ -84,8 +94,16 @@ const ATTN_SCALE = [[0, '#f8fafc'], [1, '#1e40af']];
 function short(tok) { return tok.includes(':') ? tok.split(/:(.*)/)[1] : tok; }
 function tokType(tok) { return tok.includes(':') ? tok.split(':')[0] : tok; }
 
-function fail(msg) {
-  $('#content').innerHTML = `<p class="err">${msg}</p>`;
+function fail(msg, notDisplayable = false) {
+  $('#content').innerHTML = notDisplayable ? `
+    <div class="not-displayable">
+      <h2>Model not displayable</h2>
+      <p>${msg}</p>
+      <p class="hint">This architecture has no visualisation support in the demo
+        yet. Its run parameters and metrics are still available in the model
+        dropdown's info panel and the compare-parameters table.</p>
+      <p><a href="/">← back to the demo</a></p>
+    </div>` : `<p class="err">${msg}</p>`;
 }
 
 function renderHeader(payload) {
@@ -192,6 +210,11 @@ function renderBert4rec(data) {
   box.innerHTML = `
     ${data.faithful === false
       ? '<p class="err">The instrumented re-run diverged from the encoder — treat these internals as approximate.</p>' : ''}
+    ${data.backbone === 'modernbert'
+      ? `<p class="hint">ModernBERT backbone: pre-norm blocks, RoPE (no absolute
+         positions), GeGLU FFN, bias-free. Per-stage lens readouts apply the
+         model's final LayerNorm (pre-norm residuals are only head-comparable
+         through it); trace vectors show the raw residual stream.</p>` : ''}
     <h2>Logit lens <span class="hint">the [MASK] hidden state after each layer,
       projected through the (tied) output head — where this title's score forms.
       The rest of this page IS the model, in forward-pass order: input embeddings
@@ -225,6 +248,30 @@ function renderBert4rec(data) {
           ${t.delta_prob !== null
             ? ` · ${t.delta_prob >= 0 ? '+' : ''}${(t.delta_prob * 100).toFixed(2)}pp` : ''}</span>
       </div>`).join('');
+  }
+
+  // ── DenseRec dual-path alignment ─────────────────────────────────────────
+  if (data.denserec) {
+    const dr = data.denserec;
+    const al = section(box, 'DenseRec · dual-path alignment',
+      `cosine between each token's learned ID embedding and its projected MiniLM
+       content vector (dense_path_p=${dr.dense_path_p}, d_c=${dr.content_dim}).
+       High = the two paths agree; low on a rare title means the content path
+       would place it somewhere training never put its ID. Note: this trace is
+       the in-vocab ID path — injected out-of-vocabulary tokens are scored by
+       the model but not traced here.`);
+    const maxAbs = Math.max(1e-9, ...dr.alignment.map(r => Math.abs(r.cosine)));
+    al.innerHTML = dr.alignment
+      .slice().sort((a, b) => b.cosine - a.cosine)
+      .map(r => `
+        <div class="contrib-row">
+          <span class="tok ${r.type}">${r.token}${r.is_title ? ' ← clicked title' : ''}</span>
+          <span class="bar-wrap center">
+            <span class="bar ${r.cosine >= 0 ? 'pos' : 'neg'}"
+              style="width:${Math.max(1, 50 * Math.abs(r.cosine) / maxAbs)}%"></span>
+          </span>
+          <span class="score">${r.cosine.toFixed(3)}</span>
+        </div>`).join('');
   }
 
   // ── 1 · Input embeddings ─────────────────────────────────────────────────
@@ -392,7 +439,7 @@ function renderBert4rec(data) {
     body: JSON.stringify({ tokens: payload.tokens, model: payload.model, title: payload.title }),
   });
   const data = await res.json();
-  if (data.error) return fail(data.error);
+  if (data.error) return fail(data.error, data.not_displayable === true);
   document.title = `${short(payload.title)} — ${payload.label} — inspector`;
   if (data.architecture === 'item2vec') renderItem2vec(data);
   else renderBert4rec(data);

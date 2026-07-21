@@ -36,20 +36,29 @@ KEY_METRICS = ('test_recall_at_1', 'test_recall_at_5', 'test_recall_at_10',
 
 
 def _load_model(run_dir, architecture, vocab_csv):
-    if architecture == 'bert4rec':
+    no_ckpt = ('no model checkpoint staged — the MLflow run has no logged model '
+               '(still RUNNING, or it finished without logging one); re-fetch '
+               'once the run completes')
+    if architecture in ('bert4rec', 'modernbert'):
+        # same wrapper for both — config.json's `backbone` picks the module
         from demo.bert4rec_model import Bert4RecModel
         model = Bert4RecModel.load_if_available(
-            os.path.join(run_dir, 'bert4rec'), vocab_csv=vocab_csv)
+            os.path.join(run_dir, architecture), vocab_csv=vocab_csv)
         if model is None:
-            raise FileNotFoundError(
-                'no model checkpoint staged — the MLflow run has no logged model '
-                '(still RUNNING, or it finished without logging one); re-fetch '
-                'once the run completes')
+            raise FileNotFoundError(no_ckpt)
+        return model
+    if architecture == 'denserec':
+        from demo.denserec_model import DenseRecModel
+        model = DenseRecModel.load_if_available(
+            os.path.join(run_dir, 'denserec'), vocab_csv=vocab_csv)
+        if model is None:
+            raise FileNotFoundError(no_ckpt)
         return model
     if architecture == 'item2vec':
         from demo.item2vec_model import Item2VecModel
         return Item2VecModel(os.path.join(run_dir, 'item2vec.bin'), vocab_csv=vocab_csv)
-    raise ValueError(f'unknown architecture {architecture!r}')
+    raise ValueError(f'architecture {architecture!r} is not displayable in the '
+                     f'demo (supported: item2vec, bert4rec, modernbert, denserec)')
 
 
 def _entry(run_id, run_dir, meta):

@@ -49,11 +49,20 @@ class BERT4Rec(nn.Module):
         self.head    = nn.Linear(d_model, vocab_size, bias=False)
         self.head.weight = self.item_emb.weight   # weight tying
 
-    def forward(self, ids):
+    # Hook structure mirrors the training module exactly: _input_embeddings is
+    # what DenseRec overrides (dual path / injection), _encode is what
+    # ModernBERT overrides (pre-norm/RoPE/GeGLU stack).
+
+    def _input_embeddings(self, ids):
+        return self.item_emb(ids)
+
+    def _encode(self, ids):
         pos = torch.arange(ids.size(1), device=ids.device)
-        h   = self.dropout(self.norm(self.item_emb(ids) + self.pos_emb(pos)))
-        h   = self.encoder(h, src_key_padding_mask=(ids == self.pad_id))
-        return self.head(h)
+        h = self.dropout(self.norm(self._input_embeddings(ids) + self.pos_emb(pos)))
+        return self.encoder(h, src_key_padding_mask=(ids == self.pad_id))
+
+    def forward(self, ids):
+        return self.head(self._encode(ids))
 
 
 class Vocab:
@@ -90,15 +99,7 @@ class Bert4RecModel:
             self.vocab = Vocab(json.load(f))
 
         self._max_len = self.params['max_len']
-        self.model = BERT4Rec(
-            vocab_size=self.vocab.size,
-            d_model=self.params['d_model'],
-            n_layers=self.params['n_layers'],
-            n_heads=self.params['n_heads'],
-            max_len=self._max_len,
-            dropout=self.params['dropout'],
-            pad_id=self.vocab.pad_id,
-        )
+        self.model = self._build_module()
         state = torch.load(os.path.join(artifact_dir, 'model.pt'),
                            map_location='cpu', weights_only=True)
         self.model.load_state_dict(state)
@@ -117,6 +118,23 @@ class Bert4RecModel:
             vecs = self.model.item_emb.weight[self._title_ids].numpy().copy()
         # L2-normalised: rows are unit vectors so dot product = cosine
         self.title_matrix = vecs / (np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-9)
+
+    def _build_module(self):
+        """Architecture factory — backbone from config.json; overridden by
+        DenseRecModel for the dual-path variants."""
+        cls = BERT4Rec
+        if self.params.get('backbone') == 'modernbert':
+            from demo.modernbert_model import ModernBERT4Rec
+            cls = ModernBERT4Rec
+        return cls(
+            vocab_size=self.vocab.size,
+            d_model=self.params['d_model'],
+            n_layers=self.params['n_layers'],
+            n_heads=self.params['n_heads'],
+            max_len=self._max_len,
+            dropout=self.params['dropout'],
+            pad_id=self.vocab.pad_id,
+        )
 
     @classmethod
     def load_if_available(cls, artifact_dir: str = None, vocab_csv: str = None):
@@ -172,10 +190,7 @@ class Bert4RecModel:
         seq  = [self.vocab.pad_id] * (self._max_len - 1 - len(ids)) + ids + [self.vocab.mask_id]
         ids_t = torch.tensor(seq).unsqueeze(0)
         with torch.no_grad():
-            pos = torch.arange(ids_t.size(1))
-            h = self.model.dropout(self.model.norm(
-                self.model.item_emb(ids_t) + self.model.pos_emb(pos)))
-            h = self.model.encoder(h, src_key_padding_mask=(ids_t == self.vocab.pad_id))
+            h = self.model._encode(ids_t)     # backbone-agnostic (stock/modern)
         return h[0, -1].numpy().copy(), used, unknown
 
     def rank_titles(self, context: list, top_k: int = 10, allowed: set = None,
@@ -214,10 +229,7 @@ class Bert4RecModel:
         if scoring == 'cosine':
             ids_t = torch.tensor(seq).unsqueeze(0)
             with torch.no_grad():
-                pos = torch.arange(ids_t.size(1))
-                h = self.model.dropout(self.model.norm(
-                    self.model.item_emb(ids_t) + self.model.pos_emb(pos)))
-                h = self.model.encoder(h, src_key_padding_mask=(ids_t == self.vocab.pad_id))
+                h = self.model._encode(ids_t)   # backbone-agnostic (stock/modern)
                 q = h[0, -1]
                 q = q / (q.norm() + 1e-9)
                 emb = self.model.item_emb.weight[title_ids]

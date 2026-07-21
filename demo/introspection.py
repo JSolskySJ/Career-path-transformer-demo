@@ -27,11 +27,43 @@ def _short(token):
 
 
 def inspect_model(model, architecture, tokens, title):
-    if architecture == 'bert4rec':
-        return inspect_bert4rec(model, tokens, title)
+    if architecture in ('bert4rec', 'modernbert', 'denserec'):
+        # modernbert/denserec are BERT4Rec-family — the full trace applies
+        # (the introspection dispatches per block type internally); denserec's
+        # injected OOV tokens are not traced (in-vocab view only).
+        result = inspect_bert4rec(model, tokens, title)
+        if architecture == 'denserec' and 'error' not in result:
+            result['denserec'] = _denserec_alignment(model, tokens, title)
+        return result
     if architecture == 'item2vec':
         return inspect_item2vec(model, tokens, title)
-    return {'error': f'no drill-down for architecture {architecture!r}'}
+    return {'error': f'architecture {architecture!r} has no drill-down in the demo',
+            'not_displayable': True}
+
+
+def _denserec_alignment(m, tokens, title):
+    """DenseRec dual-path view: for each in-vocab context token (and the
+    clicked title), the cosine between its learned ID embedding and its
+    projected MiniLM content vector — how far the two paths agree. Low
+    alignment on a title means the content path would place it somewhere very
+    different from where training placed its ID."""
+    import torch
+    model, vocab = m.model, m.vocab
+    rows = []
+    with torch.no_grad():
+        proj = model.proj(model.content)                 # (|V|, d)
+        for tok in list(dict.fromkeys(tokens)) + [title]:
+            idx = vocab.str2idx.get(tok)
+            if idx is None or not bool(model.has_content[idx]):
+                continue
+            a = model.item_emb.weight[idx]
+            b = proj[idx]
+            cos = float((a @ b) / (a.norm() * b.norm() + 1e-9))
+            rows.append({'token': tok, 'type': tok.split(':', 1)[0],
+                         'is_title': tok == title, 'cosine': round(cos, 4)})
+    return {'dense_path_p': m.params.get('dense_path_p'),
+            'content_dim': m.params.get('content_dim'),
+            'alignment': rows}
 
 
 # ── bert4rec ─────────────────────────────────────────────────────────────────
@@ -50,16 +82,55 @@ def _layer_forward(layer, x, kpm):
     return x2, w, sa_out, x1
 
 
+def _is_modern_block(layer) -> bool:
+    return hasattr(layer, 'qkv')          # ModernBertBlock; stock has self_attn
+
+
+def _attn_projections(layer, d_model):
+    """(W_Q, W_K, W_V, W_O, value_bias) for either backbone's attention —
+    stock nn.MultiheadAttention packs QKV rows in in_proj_weight, ModernBERT
+    in the bias-free qkv Linear."""
+    if _is_modern_block(layer):
+        W = layer.qkv.weight
+        return W[:d_model], W[d_model:2 * d_model], W[2 * d_model:], \
+            layer.attn_out.weight, None
+    sa = layer.self_attn
+    W = sa.in_proj_weight
+    bv = sa.in_proj_bias[2 * d_model:] if sa.in_proj_bias is not None else None
+    return W[:d_model], W[d_model:2 * d_model], W[2 * d_model:], \
+        sa.out_proj.weight, bv
+
+
+def _modern_layer_forward(blk, x, attn_bias):
+    """One pre-norm ModernBertBlock step with the attention weights exposed —
+    identical maths to blk(x, attn_bias) in eval mode (softmax attention
+    computed manually since SDPA doesn't return weights)."""
+    import torch
+    from torch.nn import functional as F
+    B, L, _ = x.shape
+    xn = blk.attn_norm(x)
+    q, k, v = blk.qkv(xn).chunk(3, dim=-1)
+    shape = (B, L, blk.n_heads, blk.head_dim)
+    q = blk.rope(q.view(shape).transpose(1, 2))
+    k = blk.rope(k.view(shape).transpose(1, 2))
+    v = v.view(shape).transpose(1, 2)
+    w = torch.softmax(q @ k.transpose(-1, -2) / blk.head_dim ** 0.5 + attn_bias, dim=-1)
+    sa_out = blk.attn_out((w @ v).transpose(1, 2).reshape(B, L, -1))
+    x1 = x + sa_out                                    # dropout = identity in eval
+    gate, val = blk.mlp_in(blk.mlp_norm(x1)).chunk(2, dim=-1)
+    x2 = x1 + blk.mlp_out(F.gelu(gate) * val)
+    return x2, w, sa_out, x1
+
+
 def _head_weights(layer, d_model, n_heads):
     """Per-head slices of the attention projections, display-shaped (head_dim ×
     d_model): W_Q, W_K, W_V rows for this head, and the head's W_O columns
     (transposed) — the matrix that writes the head's output back into the
-    residual stream."""
+    residual stream. Backbone-agnostic."""
     import numpy as np
     hd = d_model // n_heads
-    W = layer.self_attn.in_proj_weight.detach().numpy()
-    Wq, Wk, Wv = W[:d_model], W[d_model:2 * d_model], W[2 * d_model:]
-    Wo = layer.self_attn.out_proj.weight.detach().numpy()
+    Wq, Wk, Wv, Wo, _ = (t.detach().numpy() if t is not None else None
+                         for t in _attn_projections(layer, d_model))
     out = []
     for h in range(n_heads):
         s = slice(h * hd, (h + 1) * hd)
@@ -76,21 +147,21 @@ def _mask_value_weighted(layer, x_in, attn, pad_n, d_model, n_heads):
     """What each source token ACTUALLY contributes to the [MASK] query through
     each head: attention weight × the norm of the token's value vector
     projected through the head's W_O — attention alone ignores how big the
-    written vector is. Returns (heads, L_used) norms."""
+    written vector is. Returns (heads, L_used) norms. For the pre-norm
+    ModernBERT block the value input is LN(x), matching its forward."""
     import numpy as np
     import torch
     hd = d_model // n_heads
-    sa = layer.self_attn
-    Wv = sa.in_proj_weight[2 * d_model:]
-    bv = sa.in_proj_bias[2 * d_model:] if sa.in_proj_bias is not None else 0
+    _, _, Wv, Wo, bv = _attn_projections(layer, d_model)
     with torch.no_grad():
-        v = x_in[0] @ Wv.t() + bv                        # (L_full, d)
+        v_in = layer.attn_norm(x_in) if _is_modern_block(layer) else x_in
+        v = v_in[0] @ Wv.t() + (bv if bv is not None else 0)   # (L_full, d)
         rows = []
         for h in range(n_heads):
             s = slice(h * hd, (h + 1) * hd)
-            proj = v[:, s] @ sa.out_proj.weight[:, s].t()  # what j writes if fully attended
-            norms = proj.norm(dim=1)                       # (L_full,)
-            contrib = attn[h, -1] * norms                  # × [MASK]-row attention
+            proj = v[:, s] @ Wo[:, s].t()   # what j writes if fully attended
+            norms = proj.norm(dim=1)        # (L_full,)
+            contrib = attn[h, -1] * norms   # × [MASK]-row attention
             rows.append(np.round(contrib[pad_n:].numpy(), 4).tolist())
     return rows
 
@@ -138,44 +209,60 @@ def inspect_bert4rec(m, tokens, title):
     types = [t.split(':', 1)[0] for t in used] + ['MASK']
 
     d_model = model.item_emb.weight.shape[1]
-    n_heads = int(model.encoder.layers[0].self_attn.num_heads)
+    # ModernBERT backbone: pre-norm ModuleList blocks + final_norm, RoPE
+    # (no absolute positions). Stock: post-norm nn.TransformerEncoder.
+    modern = hasattr(model, 'final_norm')
+    blocks = list(model.encoder) if modern else list(model.encoder.layers)
+    n_heads = int(blocks[0].n_heads if modern else blocks[0].self_attn.num_heads)
+    # Pre-norm residuals are only head-comparable through the final LayerNorm —
+    # the logit lens applies it per stage; the stock backbone lenses raw h.
+    lens_h = model.final_norm if modern else (lambda h: h)
 
     model.eval()
     with torch.no_grad():
-        pos = torch.arange(m._max_len)
-        x = model.dropout(model.norm(model.item_emb(ids_t) + model.pos_emb(pos)))
+        if modern:
+            x = model.dropout(model.norm(model.item_emb(ids_t)))   # RoPE, no abs pos
+            attn_bias = model._attn_bias(ids_t, x.dtype)
+        else:
+            pos = torch.arange(m._max_len)
+            x = model.dropout(model.norm(model.item_emb(ids_t) + model.pos_emb(pos)))
         x0 = x
         # Residual-stream trace: (stage name, (1, L_full, d)) at every point in
         # the forward pass, so any token can be followed through the model.
-        trace_stages = [('embedding + position', x0)]
+        trace_stages = [('embedding' + ('' if modern else ' + position'), x0)]
         states, attns, layer_extras = [x], [], []
-        for li, layer in enumerate(model.encoder.layers, start=1):
+        for li, layer in enumerate(blocks, start=1):
             x_in = x
-            x, w, sa_out, x_after_attn = _layer_forward(layer, x, kpm)
+            if modern:
+                x, w, sa_out, x_after_attn = _modern_layer_forward(layer, x, attn_bias)
+            else:
+                x, w, sa_out, x_after_attn = _layer_forward(layer, x, kpm)
             states.append(x)
             attns.append(w[0])                        # (heads, L, L)
             trace_stages += [(f'L{li} · attention output', sa_out),
                              (f'L{li} · after attention', x_after_attn),
                              (f'L{li} · after FFN', x)]
+            ffn = ({'w1': layer.mlp_in.weight, 'w2': layer.mlp_out.weight} if modern
+                   else {'w1': layer.linear1.weight, 'w2': layer.linear2.weight})
             layer_extras.append({
                 'heads': _head_weights(layer, d_model, n_heads),
                 'mask_value_weighted': _mask_value_weighted(
                     layer, x_in, w[0], pad_n, d_model, n_heads),
-                'ffn': {
-                    'w1': np.round(layer.linear1.weight.detach().numpy(), 3).tolist(),
-                    'w2': np.round(layer.linear2.weight.detach().numpy(), 3).tolist(),
-                },
+                'ffn': {k: np.round(v.detach().numpy(), 3).tolist()
+                        for k, v in ffn.items()},
             })
-        # The displayed internals must be the model's own numbers.
-        faithful = bool(torch.allclose(
-            x, model.encoder(x0, src_key_padding_mask=kpm), atol=1e-4))
+        # The displayed internals must be the model's own numbers — the manual
+        # re-run is asserted against the module's real encoder output.
+        final = model.final_norm(x) if modern else x
+        faithful = bool(torch.allclose(final, model._encode(ids_t), atol=1e-4))
 
         title_ids = m._title_ids
         layers = []
         for i, h in enumerate(states):
             entry = {'layer': i,
                      'name': 'embedding' if i == 0 else f'encoder layer {i}'}
-            entry.update(_logit_lens(model, h[0, -1], title_id, title_ids, vocab.idx2str))
+            entry.update(_logit_lens(model, lens_h(h)[0, -1], title_id,
+                                     title_ids, vocab.idx2str))
             if i > 0:
                 # per-head attention over the non-pad positions only
                 w = attns[i - 1][:, pad_n:, pad_n:].numpy()
@@ -187,8 +274,8 @@ def inspect_bert4rec(m, tokens, title):
         # plus a per-token logit-lens readout (top title at that depth).
         trace = {'stages': [], 'vectors': [], 'top1': []}
         for name, h in trace_stages:
-            vecs = h[0, pad_n:]                       # (L_used, d)
-            logits = model.head(vecs)[:, title_ids]   # (L_used, |titles|)
+            vecs = h[0, pad_n:]                       # (L_used, d) raw residual
+            logits = model.head(lens_h(h)[0, pad_n:])[:, title_ids]   # lens view
             probs = torch.softmax(logits, dim=-1)
             top = probs.argmax(dim=-1)
             trace['stages'].append(name)
@@ -228,6 +315,7 @@ def inspect_bert4rec(m, tokens, title):
 
     return {
         'architecture': 'bert4rec',
+        'backbone': 'modernbert' if modern else 'bert4rec',
         'title': title,
         'labels': labels,          # axis labels for the attention matrices
         'token_types': types,

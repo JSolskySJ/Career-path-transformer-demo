@@ -98,6 +98,19 @@ run" selector showing that run's ranking domain and model-side
 transformations. Re-fetching a run overwrites only that run's directory;
 `--no-import` downloads into `incoming/` without staging.
 
+**Supported architectures:** `item2vec`, `bert4rec`, `modernbert` (pre-norm /
+RoPE / GeGLU backbone), and `denserec` (dual-path content embeddings; either
+the bert4rec or modernbert backbone, from the run's `backbone` param). Any
+other architecture is staged **metadata-only** — visible in the model
+dropdown / compare table with a "not displayable" note, no model download.
+
+**Downloads are cached.** `incoming/` is a persistent download cache with
+per-run filenames, so re-running the fetch (or restarting the app, which
+auto-syncs) never re-downloads an artifact already on disk — only genuinely
+new runs are pulled. A model download that the flaky tracking server
+interrupts resumes from where it stopped on the next attempt rather than
+restarting. Delete a file from `incoming/` to force its re-download.
+
 Note: every eval CSV is dominated by software/engineering careers (that's the
 evaluation set), so the flow view's title list is tech-centric.
 

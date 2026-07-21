@@ -18,6 +18,7 @@ W_SUBROLE_PREFIX  = 'W_SUBROLE:'
 W_INDUSTRY_PREFIX = 'W_INDUSTRY:'
 W_COMPANY_PREFIX  = 'W_COMPANY:'
 W_SPEC_PREFIX     = 'W_SPEC:'
+W_DESC_PREFIX     = 'W_DESC:'
 E_MAJOR_PREFIX    = 'E_MAJOR:'
 E_DEGREE_PREFIX   = 'E_DEGREE:'
 E_TYPE_PREFIX     = 'E_TYPE:'
@@ -26,7 +27,7 @@ S_SKILL_PREFIX    = 'S_SKILL:'
 
 ALL_PREFIXES = (
     W_TITLE_PREFIX, W_DURATION_PREFIX, W_ROLE_PREFIX, W_SUBROLE_PREFIX,
-    W_INDUSTRY_PREFIX, W_COMPANY_PREFIX, W_SPEC_PREFIX,
+    W_INDUSTRY_PREFIX, W_COMPANY_PREFIX, W_SPEC_PREFIX, W_DESC_PREFIX,
     E_MAJOR_PREFIX, E_DEGREE_PREFIX, E_TYPE_PREFIX, E_LEVEL_PREFIX,
     S_SKILL_PREFIX,
 )
@@ -40,6 +41,7 @@ TOKEN_TYPES = {
     'W_INDUSTRY': {'label': 'Industry',       'group': 'work'},
     'W_COMPANY':  {'label': 'Company',        'group': 'work'},
     'W_SPEC':     {'label': 'Specialisation', 'group': 'work'},
+    'W_DESC':     {'label': 'Description',    'group': 'work'},
     'E_MAJOR':    {'label': 'Major',          'group': 'education'},
     'E_DEGREE':   {'label': 'Degree',         'group': 'education'},
     'E_TYPE':     {'label': 'School type',    'group': 'education'},
@@ -61,11 +63,14 @@ def _emit(prefix, value):
 
 
 def _emit_list(prefix, values):
-    """Comma-separated string or list -> de-duped token list, order kept."""
+    """'|'-separated string or list -> de-duped token list, order kept.
+    '|' is the ONLY separator (matching group_into_experiences' join):
+    real values routinely contain commas (e.g. a major of
+    'science (b.s.), finance/accounting'), so commas must stay literal."""
     if values is None:
         return []
     if isinstance(values, str):
-        values = values.split(',')
+        values = values.split('|')
     seen, out = set(), []
     for v in values:
         tok = _emit(prefix, v)
@@ -86,10 +91,16 @@ def tokens_from_experience(exp: dict) -> list:
             _emit(W_SUBROLE_PREFIX,  exp.get('subrole')),
             _emit(W_INDUSTRY_PREFIX, exp.get('industry')),
             _emit(W_COMPANY_PREFIX,  exp.get('company')),
-        ] + _emit_list(W_SPEC_PREFIX, exp.get('spec'))
+        ] + _emit_list(W_SPEC_PREFIX, exp.get('spec')) + [
+            # descriptions are kept VERBATIM (no lowercase, no strip): training
+            # strips-then-truncates to 300 chars, so a stored value can
+            # legitimately end in a space — re-stripping would break the
+            # round-trip. strip() is used only to test emptiness.
+            (W_DESC_PREFIX + str(exp['description'])
+             if str(exp.get('description') or '').strip() else None),
+        ]
     elif exp.get('type') == 'EDUCATION':
-        candidates = [
-            _emit(E_MAJOR_PREFIX,  exp.get('major')),
+        candidates = _emit_list(E_MAJOR_PREFIX, exp.get('major')) + [
             _emit(E_DEGREE_PREFIX, exp.get('degree')),
             _emit(E_TYPE_PREFIX,   exp.get('school_type')),
             _emit(E_LEVEL_PREFIX,  exp.get('level')),
@@ -130,7 +141,7 @@ def token_value(token: str) -> str:
 _FIELD_BY_TYPE = {
     'W_TITLE': 'title', 'W_DURATION': 'duration', 'W_ROLE': 'role',
     'W_SUBROLE': 'subrole', 'W_INDUSTRY': 'industry', 'W_COMPANY': 'company',
-    'W_SPEC': 'spec',
+    'W_SPEC': 'spec', 'W_DESC': 'description',
     'E_MAJOR': 'major', 'E_DEGREE': 'degree', 'E_TYPE': 'school_type',
     'E_LEVEL': 'level',
     'S_SKILL': 'skills',
@@ -141,7 +152,7 @@ _FIELD_BY_TYPE = {
 # education = major(s)→degree→type→level; skills = a flat preamble bundle.
 _CANON_RANK = {
     'W_TITLE': 0, 'W_DURATION': 1, 'W_ROLE': 2, 'W_SUBROLE': 3,
-    'W_INDUSTRY': 4, 'W_COMPANY': 5, 'W_SPEC': 6,
+    'W_INDUSTRY': 4, 'W_COMPANY': 5, 'W_SPEC': 6, 'W_DESC': 7,
     'E_MAJOR': 0, 'E_DEGREE': 1, 'E_TYPE': 2, 'E_LEVEL': 3,
     'S_SKILL': 0,
 }
@@ -238,12 +249,15 @@ def _self_check():
     kinds = [bundle_kind(b) for b in group_token_bundles(seq)]
     assert kinds == ['SKILLS', 'EDUCATION', 'WORK', 'WORK'], kinds
     exps = group_into_experiences(seq)
-    assert exps[0] == {'type': 'SKILLS', 'skills': 'welding, forklift'}, exps[0]
-    assert exps[2]['duration'] == '1-2y' and exps[2]['spec'] == 'welding, pipes', exps[2]
+    assert exps[0] == {'type': 'SKILLS', 'skills': 'welding | forklift'}, exps[0]
+    assert exps[2]['duration'] == '1-2y' and exps[2]['spec'] == 'welding | pipes', exps[2]
+    # experiences -> tokens must reproduce the original sequence exactly (the
+    # edit-tokens feature depends on this round-trip)
+    assert tokens_from_resume(exps) == seq, tokens_from_resume(exps)
     rebuilt = tokens_from_resume([
         {'type': 'WORK', 'title': 'engineer', 'duration': '1-2y', 'role': 'engineering',
-         'company': 'acme', 'spec': 'welding, pipes'},
-        {'type': 'SKILLS', 'skills': 'welding, forklift'},   # prepended despite position
+         'company': 'acme', 'spec': 'welding | pipes'},
+        {'type': 'SKILLS', 'skills': 'welding | forklift'},   # prepended despite position
     ])
     assert rebuilt[:2] == ['S_SKILL:welding', 'S_SKILL:forklift'], rebuilt
     assert rebuilt[2:] == ['W_TITLE:engineer', 'W_DURATION:1-2y', 'W_ROLE:engineering',
@@ -265,14 +279,15 @@ def group_into_experiences(tokens: list) -> list:
     """Inverse of tokens_from_resume, for displaying a flat context as a resume.
 
     Repeated fields within one experience (e.g. a double major, several
-    skills/specialisations) are joined."""
+    skills/specialisations) are joined with ' | ' — reversible by _emit_list
+    even when individual values contain commas."""
     experiences = []
     for bundle in group_token_bundles(tokens):
         exp = {'type': bundle_kind(bundle)}
         for tok in bundle:
             field = _FIELD_BY_TYPE[token_type(tok)]
             val = token_value(tok)
-            exp[field] = f'{exp[field]}, {val}' if field in exp else val
+            exp[field] = f'{exp[field]} | {val}' if field in exp else val
         experiences.append(exp)
     return experiences
 
