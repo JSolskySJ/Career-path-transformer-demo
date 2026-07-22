@@ -466,7 +466,7 @@ function renderSampleList() {
       const key = `cpt_skills_${state.resumeRun}_${s.id}`;
       localStorage.setItem(key, JSON.stringify({
         tokens: s.context_tokens, target: s.target, label: s.label,
-        model: state.resumeRun,
+        model: state.resumeRun, experiences: s.experiences || null,
       }));
       window.open('/skills#' + encodeURIComponent(key), '_blank');
     };

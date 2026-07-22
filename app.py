@@ -214,6 +214,11 @@ def vocab():
     q     = request.args.get('q', '').strip().lower()
     limit = int(request.args.get('limit', 15))
     values = model.vocab_by_prefix().get(ttype, [])
+    if request.args.get('rankable') and ttype == 'W_TITLE':
+        # only titles the model can actually recommend (its ranking domain) —
+        # used by the skill-suggestions target picker
+        domain = {t.split(':', 1)[-1] for t in model.title_vocab}
+        values = [v for v in values if v in domain]
     if q:
         starts = [v for v in values if v.startswith(q)]
         contains = [v for v in values if q in v and not v.startswith(q)]

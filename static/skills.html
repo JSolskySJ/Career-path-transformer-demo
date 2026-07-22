@@ -29,15 +29,27 @@
   <section class="panel">
     <h1 id="head">Skill suggestions</h1>
     <div class="meta-row" id="meta"></div>
-    <div id="worker-tokens"></div>
+    <h2 id="skills-heading" style="font-size:14px; margin:12px 0 4px">Current skills</h2>
+    <div id="worker-skills" class="chips-inline"></div>
+    <details id="worker-profile-box" open style="margin-top:10px">
+      <summary style="cursor:pointer; font-size:14px; font-weight:600">Career history</summary>
+      <div id="worker-profile"></div>
+    </details>
+    <details style="margin-top:6px">
+      <summary class="hint" style="cursor:pointer">raw model tokens</summary>
+      <div id="worker-tokens"></div>
+    </details>
   </section>
 
   <section class="panel">
     <div class="controls">
       <label>Model (DenseRec runs)
         <select id="model-sel"></select></label>
-      <label>Target job title
-        <input id="target" type="text" style="min-width:260px"></label>
+      <label title="Only titles this model can actually recommend (its ranking
+             domain) — start typing to search them">Target job title
+        <input id="target" type="text" list="title-options" style="min-width:260px"
+               placeholder="type to search allowed titles…" autocomplete="off">
+        <datalist id="title-options"></datalist></label>
       <label>Top-K
         <input id="top-k" type="number" min="1" max="100" value="10" style="width:70px"></label>
       <label title="How many candidate skills to score (vocabulary frequency
@@ -46,10 +58,11 @@
         <input id="limit" type="number" min="0" placeholder="all" style="width:90px"></label>
       <button id="run" class="primary">Suggest skills</button>
     </div>
-    <p class="hint">Each candidate skill is added to the worker's skill
-       preamble and the whole ranking is recomputed — the exact model forward,
-       no approximation. The delta is how much the target title's probability
-       moves; positive means the skill lifts this role up the ranking.</p>
+    <p class="hint">What happens if this worker adds <b>one</b> skill? Each
+       candidate skill is added to the skill list above (one at a time) and the
+       whole ranking is recomputed — the exact model forward, no approximation.
+       The delta is how much the target title's probability moves; positive
+       means that single skill lifts this role up the ranking.</p>
     <div id="out"><p class="hint">Pick a target title and hit <b>Suggest skills</b>.</p></div>
     <p class="caveat"><b>Read these as skills <i>associated</i> with the
        role.</b> Deltas are correlational — workers listing a skill get the
@@ -78,6 +91,39 @@ const tokType = (t) => t.includes(':') ? t.split(':')[0] : t;
     ${payload.target ? `<span>held-out next role: <b>${short(payload.target)}</b></span>` : ''}`;
   if (payload.target) $('#target').value = short(payload.target);
 
+  // Worker profile: skills front and centre (they're what the counterfactual
+  // edits), then the career history rendered like the main resume view.
+  const skills = (payload.tokens || [])
+    .filter(t => t.startsWith('S_SKILL:')).map(short);
+  $('#skills-heading').textContent = skills.length
+    ? `Current skills (${skills.length}) — each suggestion below adds ONE skill to this list`
+    : 'Current skills — none listed; each suggestion below adds ONE skill';
+  $('#worker-skills').innerHTML = skills.length
+    ? skills.map(s => `<span class="chip-sm skill">${s}</span>`).join('')
+    : '<span class="hint">no skills on this profile</span>';
+  const profile = $('#worker-profile');
+  for (const exp of (payload.experiences || [])) {
+    if (exp.type === 'SKILLS') continue;              // shown above
+    const isWork = exp.type === 'WORK';
+    const div = document.createElement('div');
+    div.className = 'exp ' + exp.type.toLowerCase();
+    const main = isWork ? (exp.title || '—') : (exp.major || exp.degree || '—');
+    const meta = isWork
+      ? [exp.role, exp.subrole, exp.industry].filter(Boolean).join(' · ')
+      : [exp.degree, exp.school_type, exp.level].filter(Boolean).join(' · ');
+    const tenure = isWork && (exp.tenure || exp.duration)
+      ? `<span class="tenure">⏱ ${exp.tenure || exp.duration}</span>` : '';
+    const company = isWork && exp.company
+      ? `<span class="company">🏢 ${exp.company}</span>` : '';
+    div.innerHTML = `<span class="badge">${isWork ? '💼' : '🎓'}</span>
+      <span class="body"><b>${main}</b>${tenure}${company}<br>
+        <span class="meta">${meta}</span></span>`;
+    profile.appendChild(div);
+  }
+  if (!(payload.experiences || []).some(e => e.type !== 'SKILLS')) {
+    $('#worker-profile-box').style.display = 'none';
+  }
+
   // DenseRec runs only — the method needs the DenseRec ranking plumbing
   const status = await (await fetch('/api/status')).json();
   const dense = Object.values(status.models)
@@ -95,6 +141,23 @@ const tokType = (t) => t.includes(':') ? t.split(':')[0] : t;
   if (payload.model && dense.some(m => m.run_id === payload.model)) {
     sel.value = payload.model;
   }
+
+  // Queryable target list: only titles the selected model can recommend (its
+  // ranking domain). The datalist refreshes as you type and on model change.
+  let _dlTimer = null;
+  async function refreshTitleOptions() {
+    const q = $('#target').value.trim().toLowerCase();
+    const res = await fetch(`/api/vocab?type=W_TITLE&rankable=1&limit=30` +
+      `&run=${encodeURIComponent(sel.value)}&q=${encodeURIComponent(q)}`);
+    const titles = await res.json();
+    $('#title-options').innerHTML = titles.map(t => `<option value="${t}">`).join('');
+  }
+  $('#target').oninput = () => {
+    clearTimeout(_dlTimer);
+    _dlTimer = setTimeout(refreshTitleOptions, 150);
+  };
+  sel.addEventListener('change', refreshTitleOptions);
+  refreshTitleOptions();
 
   $('#run').onclick = async () => {
     const target = 'W_TITLE:' + $('#target').value.trim().toLowerCase();
