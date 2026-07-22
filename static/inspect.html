@@ -48,7 +48,9 @@
   .inspector details.flow-details > summary { cursor: pointer; color: var(--accent); font-size: 12.5px; }
   .inspector details.sec { margin: 14px 0; border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; background: var(--panel); }
   .inspector details.sec > summary { cursor: pointer; }
-  .inspector details.sec > summary .hint { margin-left: 6px; }
+  /* Hint on its own line under the heading — inline it wraps mid-sentence
+     around the disclosure triangle and reads broken. */
+  .inspector details.sec > summary .hint { display: block; margin: 2px 0 0 18px; max-width: 110ch; }
   .inspector details.flow-details { border-left: 2px solid var(--line); padding-left: 12px; }
   .inspector .weights-grid {
     display: grid;
@@ -72,9 +74,10 @@
   .inspector .bar-wrap.center .bar.pos { left: 50%; background: #059669; }
   .inspector .bar-wrap.center .bar.neg { right: 50%; background: #b91c1c; }
   .inspector .contrib-row .score {
-    flex: 0 0 110px;
+    flex: 0 0 170px;
     text-align: right;
     font-variant-numeric: tabular-nums;
+    white-space: nowrap;   /* never split a number across lines */
   }
 </style>
 </head>

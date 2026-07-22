@@ -254,6 +254,9 @@ details.exp.skills .skill-list { margin: 6px 0 2px 26px; }
 .row .grow { flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0; }
 /* min-width: 0 lets the select shrink below its widest option — without it the
    long "arch · run · date (id)" options push the box outside the card. */
+/* The run picker gets the whole line (its names are long); siblings like the
+   build button wrap below — nothing may overlap or truncate to an arrow. */
+.row .grow { flex: 1 1 100%; }
 .row .grow select { flex: 1; min-width: 0; }
 #run-props { margin: 4px 0 8px; }
 #run-props .hint { margin: 2px 0 5px; }
@@ -639,3 +642,11 @@ table.kv td:first-child { color: var(--muted); font-family: ui-monospace, Menlo,
 }
 .model-row .model-internals { font-size: 12px; color: var(--accent); text-decoration: none; white-space: nowrap; }
 .model-row .model-internals:hover { text-decoration: underline; }
+
+/* Readability guards: text never breaks mid-word, numbers never split, and
+   the input panel's resize grip gets clearance so it can't sit on content. */
+.flow-strip { flex-wrap: wrap; }
+.flow-node { min-width: 170px; }
+#input-panel { padding-bottom: 26px; }
+.pred-list .score, .contrib-row .score, .run-date, .exp-badge { white-space: nowrap; }
+.model-row label { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
