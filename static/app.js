@@ -1187,7 +1187,18 @@ function datasetLimit() {
 
 async function ensureDatasetLoaded() {
   if (state.datasetLoaded) return;
-  const data = await (await fetch('/api/datasets')).json();
+  let data;
+  try {
+    const res = await fetch('/api/datasets');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    data = await res.json();
+  } catch (e) {
+    // Typically a demo server process older than this endpoint (404 → HTML)
+    $('#dataset-note').textContent =
+      `Could not load datasets (${e.message}). If the demo server has been ` +
+      'running a while, restart it (./run.sh) to pick up the Dataset view.';
+    return;   // not marked loaded — retried on next tab visit
+  }
   state.datasets = data.datasets || [];
   const sel = $('#dataset-select');
   sel.innerHTML = '';
@@ -1348,8 +1359,14 @@ async function fetchDatasetPage() {
     limit: datasetLimit(),
     filters: JSON.stringify(state.datasetFilters),
   });
-  const res = await fetch('/api/dataset?' + params);
-  const data = await res.json();
+  let data;
+  try {
+    const res = await fetch('/api/dataset?' + params);
+    data = await res.json();
+  } catch (e) {
+    $('#dataset-note').textContent = `Could not load rows (${e.message}).`;
+    return null;
+  }
   if (data.error) { $('#dataset-note').textContent = data.error; return null; }
   return data;
 }

@@ -75,6 +75,10 @@ main {
    (many model columns) then scrolls INSIDE .predictions-grid instead of
    stretching the whole page horizontally. */
 #results-panel { min-width: 0; }
+/* Single-panel view: without these the panel lands in the `auto` track and
+   grows to the table's intrinsic width, scrolling the whole page. */
+#view-dataset { grid-template-columns: 1fr; }
+#dataset-panel { min-width: 0; }
 @media (max-width: 1100px) {
   main { grid-template-columns: 1fr; }
   #input-panel { width: auto; resize: none; }
