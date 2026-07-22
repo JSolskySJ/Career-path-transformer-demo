@@ -209,9 +209,12 @@ def _slice_table(data_run_id: str):
         col = t.column(name)
         ty = col.type
         if pa.types.is_list(ty) or pa.types.is_large_list(ty):
-            joined = [' | '.join('' if v is None else str(v) for v in row)
-                      if row is not None else None for row in col.to_pylist()]
-            t = t.set_column(i, name, pa.array(joined, type=pa.string()))
+            # vectorised join — the per-row Python loop took ~20s across the
+            # slice's list columns, which read as a broken (blank) page on
+            # the first visit. Null elements inside lists: null result row,
+            # same as a null list (rare; none observed in the real slices).
+            joined = pc.binary_join(pc.cast(col, pa.list_(pa.string())), ' | ')
+            t = t.set_column(i, name, joined)
         elif not pa.types.is_string(ty):
             t = t.set_column(i, name, pc.cast(col, pa.string()))
     return t

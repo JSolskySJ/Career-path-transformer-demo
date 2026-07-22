@@ -1447,6 +1447,10 @@ async function fetchDatasetPage() {
     limit: datasetLimit(),
     filters: JSON.stringify(state.datasetFilters),
   });
+  // Never a silent blank page: the first request per dataset loads the whole
+  // slice server-side, so say so while it runs.
+  $('#dataset-note').textContent =
+    'Loading rows… (the first visit to a dataset loads its whole slice — a few seconds)';
   let data;
   try {
     const res = await fetch('/api/dataset?' + params);
