@@ -31,6 +31,7 @@ def ensure_eval_slice(data_run_id: str) -> str:
     path = os.path.join(DATASETS_DIR, f'{data_run_id}.parquet')
     if os.path.exists(path):
         return path
+    import pyarrow as pa
     import pyarrow.dataset as pads
     import pyarrow.parquet as pq
     from modules.utils import get_dataset_input
@@ -40,10 +41,34 @@ def ensure_eval_slice(data_run_id: str) -> str:
         return None
     print(f'[slice] downloading VAL+TEST rows of {data_run_id} '
           f'(one-time, reused for all runs on this dataset)...', flush=True)
-    table = ds.to_table(filter=pads.field('split').isin(['VAL', 'TEST']))
     os.makedirs(DATASETS_DIR, exist_ok=True)
-    pq.write_table(table, path)
-    print(f'[slice] {table.num_rows:,} rows -> {path} '
+    # Stream in batches, flushing to disk every ~1GB — never the whole
+    # (potentially tens-of-GB) filtered dataset in memory at once. Written to
+    # .part and renamed so an interrupted download can't leave a "complete"
+    # file behind.
+    chunk_bytes = 1 << 30
+    scanner = ds.scanner(filter=pads.field('split').isin(['VAL', 'TEST']))
+    tmp = path + '.part'
+    n_rows = buf_bytes = 0
+    buf = []
+    try:
+        with pq.ParquetWriter(tmp, ds.schema) as writer:
+            for batch in scanner.to_batches():
+                buf.append(batch)
+                buf_bytes += batch.nbytes
+                n_rows += batch.num_rows
+                if buf_bytes >= chunk_bytes:
+                    writer.write_table(pa.Table.from_batches(buf, schema=ds.schema))
+                    print(f'[slice] ...{n_rows:,} rows '
+                          f'({os.path.getsize(tmp) / 1e6:.0f} MB on disk)', flush=True)
+                    buf, buf_bytes = [], 0
+            if buf:
+                writer.write_table(pa.Table.from_batches(buf, schema=ds.schema))
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+    print(f'[slice] {n_rows:,} rows -> {path} '
           f'({os.path.getsize(path) / 1e6:.0f} MB)', flush=True)
     _ensure_title_stats(data_run_id, ds)
     return path
@@ -61,28 +86,42 @@ def _ensure_title_stats(data_run_id, ds) -> str:
     path = _title_stats_path(data_run_id)
     if os.path.exists(path):
         return path
-    print('[slice] computing full-corpus title stats (narrow scan)...', flush=True)
+    print('[slice] computing full-corpus title stats (narrow batched scan)...', flush=True)
     cols = [c for c in ('experience_type', 'work_title_name',
                         'taxonomy_normalised_job_title', 'is_sj_title')
             if c in ds.schema.names]
-    df = ds.to_table(columns=cols).to_pandas()
-    df = df[df['experience_type'] == 'WORK']
-    raw = df['work_title_name'].astype('string').str.strip().str.lower()
-    raw = raw.replace('', None)
-    if 'taxonomy_normalised_job_title' in df.columns:
-        l3col = df['taxonomy_normalised_job_title'].astype('string').str.strip().str.lower()
-        l3 = l3col.replace('', None).fillna(raw)
-        l3_values = sorted(l3col.dropna().unique())
-    else:
-        l3, l3_values = raw, []
-    sj = df['is_sj_title'].fillna(False).astype(bool) if 'is_sj_title' in df.columns \
-        else raw.notna() & False
+    from collections import Counter
+    has_l3 = 'taxonomy_normalised_job_title' in cols
+    has_sj = 'is_sj_title' in cols
+    freq_raw, freq_l3 = Counter(), Counter()
+    sj_raw, sj_l3, l3_values = set(), set(), set()
+    # Batched aggregation — same numbers as the previous whole-table pandas
+    # pass, but only one batch of 4 columns in memory at a time.
+    for batch in ds.scanner(columns=cols).to_batches():
+        df = batch.to_pandas()
+        df = df[df['experience_type'] == 'WORK']
+        if df.empty:
+            continue
+        raw = df['work_title_name'].astype('string').str.strip().str.lower()
+        raw = raw.replace('', None)
+        if has_l3:
+            l3col = df['taxonomy_normalised_job_title'].astype('string').str.strip().str.lower()
+            l3 = l3col.replace('', None).fillna(raw)
+            l3_values.update(l3col.dropna().unique())
+        else:
+            l3 = raw
+        sj = df['is_sj_title'].fillna(False).astype(bool) if has_sj \
+            else raw.notna() & False
+        freq_raw.update(raw.dropna())
+        freq_l3.update(l3.dropna())
+        sj_raw.update(raw[sj].dropna())
+        sj_l3.update(l3[sj].dropna())
     stats = {
-        'freq_freetext': raw.value_counts().to_dict(),
-        'freq_l3': l3.value_counts().to_dict(),
-        'sj_freetext': sorted(raw[sj].dropna().unique()),
-        'sj_l3': sorted(l3[sj].dropna().unique()),
-        'l3_values': l3_values,
+        'freq_freetext': dict(freq_raw),
+        'freq_l3': dict(freq_l3),
+        'sj_freetext': sorted(sj_raw),
+        'sj_l3': sorted(sj_l3),
+        'l3_values': sorted(l3_values),
     }
     with open(path, 'w') as f:
         json.dump(stats, f)
