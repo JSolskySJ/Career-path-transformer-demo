@@ -91,6 +91,123 @@ def _ensure_title_stats(data_run_id, ds) -> str:
     return path
 
 
+def latest_data_run_ids(runs: dict, n: int = 3) -> list:
+    """Distinct data_run_ids used by the newest `n` staged runs (by start_time)."""
+    ordered = sorted((r for r in runs.values() if r.get('start_time')),
+                     key=lambda r: r['start_time'], reverse=True)
+    ids = []
+    for r in ordered[:n]:
+        did = (r.get('params') or {}).get('data_run_id')
+        if did and str(did).lower() != 'none' and did not in ids:
+            ids.append(did)
+    return ids
+
+
+def sync_datasets(runs: dict, n: int = 3, env: str = 'test-prod-sj') -> list:
+    """On start, ensure the VAL+TEST slice exists for each dataset used by the
+    latest `n` runs. Downloads only genuinely new datasets; already-sliced ones
+    are a no-op (no S3 touched). Returns the ids checked."""
+    ids = latest_data_run_ids(runs, n)
+    missing = [d for d in ids
+               if not os.path.exists(os.path.join(DATASETS_DIR, f'{d}.parquet'))]
+    if missing:
+        os.environ.setdefault('SPARK_MODE', 'local')
+        if not os.path.isdir(os.environ.get('SPARK_CONFIG_HOME', '')):
+            os.environ['SPARK_CONFIG_HOME'] = os.path.join(
+                config.DWH_ROOT, 'datawarehouse-configurations')
+        if _DWH_AI not in sys.path:
+            sys.path.insert(0, _DWH_AI)
+        from modules.config_utils import generate_config
+        generate_config(env)                      # AWS env creds for the S3 read
+        for d in missing:
+            try:
+                ensure_eval_slice(d)
+            except Exception as e:                # one bad dataset mustn't block start
+                print(f'[slice] failed for {d}: {e}', flush=True)
+    return ids
+
+
+def available_datasets(runs: dict) -> list:
+    """Sliced datasets on disk, each annotated with the runs trained on it."""
+    if not os.path.isdir(DATASETS_DIR):
+        return []
+    import pyarrow.parquet as pq
+    out = []
+    for fn in sorted(os.listdir(DATASETS_DIR)):
+        if not fn.endswith('.parquet'):
+            continue
+        did = fn[:-len('.parquet')]
+        path = os.path.join(DATASETS_DIR, fn)
+        meta = pq.ParquetFile(path).metadata
+        used_by = sorted(r['label'] for r in runs.values()
+                         if (r.get('params') or {}).get('data_run_id') == did)
+        out.append({
+            'data_run_id': did,
+            'rows': meta.num_rows,
+            'columns': meta.num_columns,
+            'size_mb': round(os.path.getsize(path) / 1e6),
+            'used_by': used_by,
+        })
+    return out
+
+
+# ponytail: whole slice cached in RAM (maxsize 2) so paging is instant; a slice
+# is a few % of the corpus (~350k rows). Swap for row-group paging if it bloats.
+import functools
+
+
+@functools.lru_cache(maxsize=2)
+def _slice_table(data_run_id: str):
+    """Every column reduced to a string (JSON-safe, uniformly filterable):
+    date32 can hold year-0 values pandas/to_pylist can't represent, and list
+    columns join to '<a> | <b>' — so display and substring filtering share one
+    representation."""
+    import pyarrow.compute as pc
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    t = pq.read_table(os.path.join(DATASETS_DIR, f'{data_run_id}.parquet'))
+    for i, name in enumerate(t.column_names):
+        col = t.column(name)
+        ty = col.type
+        if pa.types.is_list(ty) or pa.types.is_large_list(ty):
+            joined = [' | '.join('' if v is None else str(v) for v in row)
+                      if row is not None else None for row in col.to_pylist()]
+            t = t.set_column(i, name, pa.array(joined, type=pa.string()))
+        elif not pa.types.is_string(ty):
+            t = t.set_column(i, name, pc.cast(col, pa.string()))
+    return t
+
+
+def read_slice(data_run_id: str, offset: int = 0, limit: int = 50,
+               filters: dict = None) -> dict:
+    """Adaptable table page: columns are whatever the parquet has (auto-detects
+    new fields). `filters` is {column: substring} — case-insensitive contains,
+    applied over the WHOLE slice (all filters ANDed) before paging."""
+    path = os.path.join(DATASETS_DIR, f'{data_run_id}.parquet')
+    if not os.path.exists(path):
+        raise FileNotFoundError(f'no slice for {data_run_id}')
+    t = _slice_table(data_run_id)
+    if filters:
+        import pyarrow.compute as pc
+        mask = None
+        for col, sub in filters.items():
+            if col not in t.column_names or not sub:
+                continue
+            m = pc.match_substring(pc.fill_null(t.column(col), ''),
+                                   sub, ignore_case=True)
+            mask = m if mask is None else pc.and_(mask, m)
+        if mask is not None:
+            t = t.filter(mask)
+    return {
+        'data_run_id': data_run_id,
+        'columns': t.column_names,
+        'rows': t.slice(offset, limit).to_pylist(),
+        'total': t.num_rows,
+        'offset': offset,
+        'limit': limit,
+    }
+
+
 def build_samples_for_run(params: dict, data_run_id: str, out_path: str,
                           n: int = 300, env: str = 'test-prod-sj',
                           sample_seed: int = 42) -> dict:

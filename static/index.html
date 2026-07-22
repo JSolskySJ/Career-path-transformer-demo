@@ -15,6 +15,7 @@
     <nav class="view-switch">
       <button class="view-btn active" data-view="predict">Predict</button>
       <button class="view-btn" data-view="flow">Job title flow</button>
+      <button class="view-btn" data-view="dataset">Dataset</button>
     </nav>
   </div>
 </header>
@@ -192,6 +193,39 @@
        transition flow. Node colour marks the starting (selected) titles and
        their downstream paths; grey <b>Other</b> nodes bin the long tail of
        less-common transitions for each source.</p>
+  </section>
+</main>
+
+<!-- ── Raw dataset viewer ───────────────────────────────────────────── -->
+<main id="view-dataset" class="hidden">
+  <section class="panel" id="dataset-panel">
+    <h2>Raw training dataset <span class="hint">— held-out (VAL + TEST) slice of
+       each run's dataset, exactly as the models saw it</span></h2>
+    <div class="row plot-controls">
+      <label>Dataset
+        <select id="dataset-select"></select>
+      </label>
+      <label>Rows per page
+        <input id="dataset-limit" type="number" min="1" max="500" value="50">
+      </label>
+      <button id="dataset-prev" class="ghost">◀ Prev</button>
+      <button id="dataset-next" class="ghost">Next ▶</button>
+      <details id="dataset-columns" class="col-picker">
+        <summary>Columns</summary>
+        <div class="col-picker-body">
+          <div class="row">
+            <button id="dataset-cols-all" class="ghost">Show all</button>
+            <button id="dataset-cols-none" class="ghost">Hide all</button>
+          </div>
+          <div id="dataset-cols-list"></div>
+        </div>
+      </details>
+      <span id="dataset-info" class="hint"></span>
+    </div>
+    <p id="dataset-note" class="hint"></p>
+    <p class="hint">Drag a column header to reorder · type in a header cell to
+       filter that field (contains, whole slice) · use <b>Columns</b> to hide fields.</p>
+    <div id="dataset-table" class="dataset-table"></div>
   </section>
 </main>
 

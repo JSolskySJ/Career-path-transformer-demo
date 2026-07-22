@@ -23,6 +23,15 @@ const state = {
   depth: 1,
   sankeyNodes: [],
   hoveredNode: null,
+  // raw dataset viewer
+  datasets: [],
+  datasetId: null,
+  datasetOffset: 0,
+  datasetLoaded: false,
+  datasetColOrder: [],       // column display order (drag-reorderable)
+  datasetHidden: new Set(),  // hidden columns
+  datasetFilters: {},        // column -> substring filter
+  datasetPage: null,         // last /api/dataset response
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -1167,6 +1176,209 @@ function hexA(hex, a) {
   return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${a})`;
 }
 
+/* ── Raw dataset viewer ─────────────────────────────────────────────────── */
+
+const escHtml = (s) => String(s ?? '')
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+function datasetLimit() {
+  return Math.max(1, Math.min(parseInt($('#dataset-limit').value, 10) || 50, 500));
+}
+
+async function ensureDatasetLoaded() {
+  if (state.datasetLoaded) return;
+  const data = await (await fetch('/api/datasets')).json();
+  state.datasets = data.datasets || [];
+  const sel = $('#dataset-select');
+  sel.innerHTML = '';
+  if (!state.datasets.length) {
+    $('#dataset-note').textContent =
+      'No dataset slices staged yet. They download on start for the latest runs; ' +
+      'set CPT_SYNC_DATASETS=1 and restart, or build samples from a dataset.';
+    $('#dataset-table').innerHTML = '';
+    state.datasetLoaded = true;
+    return;
+  }
+  for (const d of state.datasets) {
+    const opt = document.createElement('option');
+    opt.value = d.data_run_id;
+    opt.textContent = `${d.data_run_id.slice(0, 8)} — ${d.rows.toLocaleString()} rows, ` +
+                      `${d.columns} cols${d.used_by.length ? ' · ' + d.used_by.join(', ') : ''}`;
+    sel.appendChild(opt);
+  }
+  state.datasetId = state.datasets[0].data_run_id;
+  state.datasetOffset = 0;
+  state.datasetLoaded = true;
+  await loadDatasetPage();
+}
+
+async function loadDatasetPage() {
+  const data = await fetchDatasetPage();
+  if (!data) return;
+  syncDatasetSchema(data.columns);
+  renderDatasetTable(data);
+}
+
+const fmtCell = (v) => (v === null || v === undefined) ? '' : String(v);
+
+// Visible columns in display order (colOrder minus hidden), for the active dataset.
+function visibleColumns() {
+  return state.datasetColOrder.filter(c => !state.datasetHidden.has(c));
+}
+
+// Reset column order/visibility/filters when the dataset's schema first appears
+// or changes (adaptable — new fields just show up in schema order).
+function syncDatasetSchema(columns) {
+  const same = state.datasetColOrder.length === columns.length &&
+    state.datasetColOrder.every(c => columns.includes(c));
+  if (same) return;
+  state.datasetColOrder = columns.slice();
+  state.datasetHidden = new Set();
+  state.datasetFilters = {};
+  renderColumnPicker();
+}
+
+function renderColumnPicker() {
+  const list = $('#dataset-cols-list');
+  list.innerHTML = '';
+  for (const c of state.datasetColOrder) {
+    const id = 'colchk-' + c;
+    const lbl = document.createElement('label');
+    lbl.className = 'col-toggle';
+    lbl.innerHTML =
+      `<input type="checkbox" id="${id}" ${state.datasetHidden.has(c) ? '' : 'checked'}>` +
+      `<span>${escHtml(c)}</span>`;
+    lbl.querySelector('input').onchange = (e) => {
+      if (e.target.checked) state.datasetHidden.delete(c);
+      else state.datasetHidden.add(c);
+      renderDatasetTable(state.datasetPage);
+    };
+    list.appendChild(lbl);
+  }
+}
+
+// Full (re)render — used on load and structural changes (hide/reorder).
+function renderDatasetTable(data) {
+  if (!data) return;
+  state.datasetPage = data;
+  const from = data.total ? data.offset + 1 : 0;
+  const to = Math.min(data.offset + data.limit, data.total);
+  $('#dataset-info').textContent =
+    `${from.toLocaleString()}–${to.toLocaleString()} of ${data.total.toLocaleString()}`;
+  const d = state.datasets.find(x => x.data_run_id === data.data_run_id);
+  $('#dataset-note').textContent = d && d.used_by.length
+    ? `Trained on by: ${d.used_by.join(', ')}` : '';
+  $('#dataset-prev').disabled = data.offset <= 0;
+  $('#dataset-next').disabled = to >= data.total;
+
+  const cols = visibleColumns();
+  const labelRow = cols.map(c =>
+    `<th draggable="true" data-col="${escHtml(c)}">${escHtml(c)}</th>`).join('');
+  const filterRow = cols.map(c =>
+    `<th><input class="col-filter" data-col="${escHtml(c)}" ` +
+    `value="${escHtml(state.datasetFilters[c] || '')}" placeholder="filter…"></th>`).join('');
+  $('#dataset-table').innerHTML =
+    `<table><thead><tr>${labelRow}</tr><tr class="filter-row">${filterRow}</tr></thead>` +
+    `<tbody>${renderDatasetBody(data, cols)}</tbody></table>`;
+  wireHeaderDrag();
+  wireFilterInputs();
+}
+
+function renderDatasetBody(data, cols) {
+  return data.rows.map(r =>
+    '<tr>' + cols.map(c => `<td title="${escHtml(fmtCell(r[c]))}">${escHtml(fmtCell(r[c]))}</td>`).join('') + '</tr>'
+  ).join('');
+}
+
+// Column reorder via native HTML5 drag-and-drop on the label header cells.
+function wireHeaderDrag() {
+  let dragCol = null;
+  $('#dataset-table').querySelectorAll('th[draggable]').forEach(th => {
+    th.ondragstart = () => { dragCol = th.dataset.col; };
+    th.ondragover = (e) => { e.preventDefault(); th.classList.add('drop-target'); };
+    th.ondragleave = () => th.classList.remove('drop-target');
+    th.ondrop = (e) => {
+      e.preventDefault();
+      th.classList.remove('drop-target');
+      const target = th.dataset.col;
+      if (!dragCol || dragCol === target) return;
+      const order = state.datasetColOrder;
+      order.splice(order.indexOf(dragCol), 1);
+      order.splice(order.indexOf(target), 0, dragCol);
+      renderDatasetTable(state.datasetPage);
+    };
+  });
+}
+
+// Per-field filters: debounced refetch (whole-slice), then only tbody + paging
+// are swapped so the focused filter input keeps focus and caret.
+let _filterTimer = null;
+function wireFilterInputs() {
+  $('#dataset-table').querySelectorAll('.col-filter').forEach(inp => {
+    inp.oninput = () => {
+      const col = inp.dataset.col;
+      const v = inp.value.trim();
+      if (v) state.datasetFilters[col] = v; else delete state.datasetFilters[col];
+      state.datasetOffset = 0;
+      clearTimeout(_filterTimer);
+      _filterTimer = setTimeout(applyDatasetFilters, 250);
+    };
+  });
+}
+
+async function applyDatasetFilters() {
+  const data = await fetchDatasetPage();
+  if (!data) return;
+  state.datasetPage = data;
+  const cols = visibleColumns();
+  const from = data.total ? data.offset + 1 : 0;
+  const to = Math.min(data.offset + data.limit, data.total);
+  $('#dataset-info').textContent =
+    `${from.toLocaleString()}–${to.toLocaleString()} of ${data.total.toLocaleString()}`;
+  $('#dataset-prev').disabled = data.offset <= 0;
+  $('#dataset-next').disabled = to >= data.total;
+  $('#dataset-table').querySelector('tbody').innerHTML = renderDatasetBody(data, cols);
+}
+
+async function fetchDatasetPage() {
+  if (!state.datasetId) return null;
+  const params = new URLSearchParams({
+    id: state.datasetId,
+    offset: state.datasetOffset,
+    limit: datasetLimit(),
+    filters: JSON.stringify(state.datasetFilters),
+  });
+  const res = await fetch('/api/dataset?' + params);
+  const data = await res.json();
+  if (data.error) { $('#dataset-note').textContent = data.error; return null; }
+  return data;
+}
+
+$('#dataset-select').onchange = (e) => {
+  state.datasetId = e.target.value;
+  state.datasetOffset = 0;
+  loadDatasetPage();
+};
+$('#dataset-limit').onchange = () => { state.datasetOffset = 0; loadDatasetPage(); };
+$('#dataset-prev').onclick = () => {
+  state.datasetOffset = Math.max(0, state.datasetOffset - datasetLimit());
+  loadDatasetPage();
+};
+$('#dataset-next').onclick = () => {
+  state.datasetOffset += datasetLimit();
+  loadDatasetPage();
+};
+$('#dataset-cols-all').onclick = () => {
+  state.datasetHidden.clear();
+  renderColumnPicker();
+  renderDatasetTable(state.datasetPage);
+};
+$('#dataset-cols-none').onclick = () => {
+  state.datasetColOrder.forEach(c => state.datasetHidden.add(c));
+  renderColumnPicker();
+  renderDatasetTable(state.datasetPage);
+};
+
 /* ── Wiring ─────────────────────────────────────────────────────────────── */
 
 document.querySelectorAll('.view-btn').forEach(btn => {
@@ -1176,10 +1388,12 @@ document.querySelectorAll('.view-btn').forEach(btn => {
     state.view = btn.dataset.view;
     $('#view-predict').classList.toggle('hidden', state.view !== 'predict');
     $('#view-flow').classList.toggle('hidden', state.view !== 'flow');
+    $('#view-dataset').classList.toggle('hidden', state.view !== 'dataset');
     if (state.view === 'flow') {
       await ensureFlowLoaded();
       Plotly.Plots.resize('sankey-plot');
     }
+    if (state.view === 'dataset') await ensureDatasetLoaded();
   };
 });
 

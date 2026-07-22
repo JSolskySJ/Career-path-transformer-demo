@@ -52,6 +52,15 @@ def load_models():
         else:
             print(f"FAILED {r['label']} ({rid[:8]}): {r['error']}")
 
+    # Ensure the VAL+TEST dataset slice exists for the latest few runs' datasets
+    # (Dataset view). New datasets download once; existing ones are a no-op.
+    if os.environ.get('CPT_SYNC_DATASETS', '1') != '0':
+        try:
+            from demo.dataset_samples import sync_datasets
+            sync_datasets(RUNS, n=3)
+        except Exception as e:
+            print(f'dataset sync skipped ({e})')
+
     try:
         from demo.transitions import TransitionStore
         store = TransitionStore.load_if_available()
@@ -305,6 +314,27 @@ def inspect_endpoint():   # named to avoid shadowing the stdlib `inspect` module
     result['model'] = rid
     result['label'] = r['label']
     return jsonify(result)
+
+
+@app.route('/api/datasets')
+def datasets():
+    """Sliced datasets available for the Dataset view, with the runs on each."""
+    from demo.dataset_samples import available_datasets
+    return jsonify({'datasets': available_datasets(RUNS)})
+
+
+@app.route('/api/dataset')
+def dataset():
+    """A page of raw rows: /api/dataset?id=<data_run_id>&offset=0&limit=50"""
+    did = request.args.get('id', '')
+    offset = max(0, int(request.args.get('offset', 0)))
+    limit = max(1, min(int(request.args.get('limit', 50)), 500))
+    filters = json.loads(request.args.get('filters') or '{}')
+    try:
+        from demo.dataset_samples import read_slice
+        return jsonify(read_slice(did, offset, limit, filters))
+    except FileNotFoundError as e:
+        return jsonify({'error': str(e)}), 404
 
 
 @app.route('/api/transition_titles')
