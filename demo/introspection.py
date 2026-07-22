@@ -70,16 +70,27 @@ def _denserec_alignment(m, tokens, title):
 
 def _layer_forward(layer, x, kpm):
     """One post-norm TransformerEncoderLayer step, returning
-    (x_out, attn_weights, attn_block_out, x_after_attn) — identical maths to
-    layer(x, src_key_padding_mask=kpm) in eval mode, but with need_weights=True
-    and the residual-stream intermediates exposed for the trace."""
+    (x_out, attn_weights, attn_block_out, x_after_attn, qkv) — identical maths
+    to layer(x, src_key_padding_mask=kpm) in eval mode, but with
+    need_weights=True and the residual-stream intermediates exposed for the
+    trace. qkv is the per-head (1, H, L, hd) projected queries/keys/values the
+    attention actually used (recomputed from in_proj; the weights returned by
+    self_attn are asserted faithful downstream)."""
     import torch  # noqa: F401  (torch types flow through)
     sa_out, w = layer.self_attn(x, x, x, key_padding_mask=kpm,
                                 need_weights=True, average_attn_weights=False)
+    sa = layer.self_attn
+    d = x.shape[-1]
+    H = sa.num_heads
+    b = sa.in_proj_bias if sa.in_proj_bias is not None else torch.zeros(3 * d)
+    heads = []
+    for i, (W, bb) in enumerate(zip(sa.in_proj_weight.chunk(3), b.chunk(3))):
+        t = (x @ W.t() + bb).view(x.shape[0], x.shape[1], H, d // H)
+        heads.append(t.transpose(1, 2))                # (1, H, L, hd)
     x1 = layer.norm1(x + layer.dropout1(sa_out))
     ff = layer.linear2(layer.dropout(layer.activation(layer.linear1(x1))))
     x2 = layer.norm2(x1 + layer.dropout2(ff))
-    return x2, w, sa_out, x1
+    return x2, w, sa_out, x1, tuple(heads)
 
 
 def _is_modern_block(layer) -> bool:
@@ -119,7 +130,7 @@ def _modern_layer_forward(blk, x, attn_bias):
     x1 = x + sa_out                                    # dropout = identity in eval
     gate, val = blk.mlp_in(blk.mlp_norm(x1)).chunk(2, dim=-1)
     x2 = x1 + blk.mlp_out(F.gelu(gate) * val)
-    return x2, w, sa_out, x1
+    return x2, w, sa_out, x1, (q, k, v)                # q,k post-RoPE — as attended
 
 
 def _head_weights(layer, d_model, n_heads):
@@ -164,6 +175,32 @@ def _mask_value_weighted(layer, x_in, attn, pad_n, d_model, n_heads):
             contrib = attn[h, -1] * norms   # × [MASK]-row attention
             rows.append(np.round(contrib[pad_n:].numpy(), 4).tolist())
     return rows
+
+
+def _attn_steps(qkv, attn, pad_n):
+    """The matrix-operation steps of attention for one layer, per head — the
+    data actually flowing through, pad positions trimmed:
+      q, k, v      (L_used, head_dim)  projected (and RoPE-rotated) vectors
+      scores       (L_used, L_used)    QKᵀ/√d — pre-softmax alignment
+      weights      (L_used, L_used)    softmax(scores) — from the real forward
+      head_out     (L_used, head_dim)  weights @ V — the head's mixed output
+    softmax(displayed scores) equals the displayed weights up to the padding
+    mask, so the arithmetic can be followed end to end."""
+    import numpy as np
+    q, k, v = (t[0] for t in qkv)                     # (H, L, hd)
+    hd = q.shape[-1]
+    scores = (q @ k.transpose(-1, -2)) / hd ** 0.5    # (H, L, L)
+    head_out = attn @ v                                # (H, L, hd)
+    out = []
+    for h in range(q.shape[0]):
+        out.append({
+            'q': np.round(q[h, pad_n:].numpy(), 3).tolist(),
+            'k': np.round(k[h, pad_n:].numpy(), 3).tolist(),
+            'v': np.round(v[h, pad_n:].numpy(), 3).tolist(),
+            'scores': np.round(scores[h, pad_n:, pad_n:].numpy(), 3).tolist(),
+            'head_out': np.round(head_out[h, pad_n:].numpy(), 3).tolist(),
+        })
+    return out
 
 
 def _logit_lens(model, hidden_mask, title_id, title_ids, idx2str, top_k=5):
@@ -267,9 +304,9 @@ def inspect_bert4rec(m, tokens, title):
         for li, layer in enumerate(blocks, start=1):
             x_in = x
             if modern:
-                x, w, sa_out, x_after_attn = _modern_layer_forward(layer, x, attn_bias)
+                x, w, sa_out, x_after_attn, qkv = _modern_layer_forward(layer, x, attn_bias)
             else:
-                x, w, sa_out, x_after_attn = _layer_forward(layer, x, kpm)
+                x, w, sa_out, x_after_attn, qkv = _layer_forward(layer, x, kpm)
             states.append(x)
             attns.append(w[0])                        # (heads, L, L)
             trace_stages += [(f'L{li} · attention output', sa_out),
@@ -279,6 +316,7 @@ def inspect_bert4rec(m, tokens, title):
                    else {'w1': layer.linear1.weight, 'w2': layer.linear2.weight})
             layer_extras.append({
                 'heads': _head_weights(layer, d_model, n_heads),
+                'attn_steps': _attn_steps(qkv, w[0], pad_n),
                 'mask_value_weighted': _mask_value_weighted(
                     layer, x_in, w[0], pad_n, d_model, n_heads),
                 'ffn': {k: np.round(v.detach().numpy(), 3).tolist()
