@@ -355,6 +355,42 @@ def dataset():
         return jsonify({'error': str(e)}), 404
 
 
+@app.route('/skills')
+def skills_page():
+    """Counterfactual skill suggestions for one worker, opened per sample."""
+    return send_from_directory('static', 'skills.html')
+
+
+@app.route('/api/suggest_skills', methods=['POST'])
+def suggest_skills():
+    """Top-k skills whose addition most improves the target title's rank.
+    DenseRec runs only. Brute force over the skill vocabulary — slow-ish
+    (a few chunked forward passes), so the page shows progress copy."""
+    payload = request.get_json(force=True)
+    rid = payload.get('model', '')
+    r = RUNS.get(rid)
+    if r is None:
+        return jsonify({'error': f'unknown run {rid}'}), 400
+    tokens = payload.get('tokens') or []
+    target = payload.get('target', '')
+    if not tokens or not target:
+        return jsonify({'error': 'tokens and target are required'}), 400
+    try:
+        from demo.skills import suggest
+        result = suggest(rid, r, tokens, target,
+                         top_k=int(payload.get('top_k', 10)),
+                         limit=int(payload.get('limit', 0)))
+    except (ValueError, FileNotFoundError) as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    result['model'] = rid
+    result['label'] = r['label']
+    result['experiment'] = r.get('experiment')
+    return jsonify(result)
+
+
 @app.route('/api/transition_titles')
 def transition_titles():
     store = TRANSITIONS['store']

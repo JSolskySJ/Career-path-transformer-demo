@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Skill suggestions — Career Path Transformer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/static/style.css">
+<style>
+  main.skills { display: block; max-width: 980px; margin: 0 auto; padding: 14px 18px 60px; }
+  .skills .panel { margin-bottom: 14px; }
+  .skills h1 { font-size: 19px; margin: 0; }
+  .skills .meta-row { display: flex; flex-wrap: wrap; gap: 14px; color: var(--muted); font-size: 12.5px; margin-top: 4px; }
+  .skills #worker-tokens { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+  .skills .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; margin: 10px 0; }
+  .skills .controls label { display: flex; flex-direction: column; gap: 3px; font-size: 12.5px; color: var(--muted); }
+  .skills .baseline { font-size: 14px; margin: 10px 0; }
+  .skills .sugg-row { display: flex; align-items: center; gap: 10px; padding: 5px 0; }
+  .skills .sugg-row .skill { flex: 0 0 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .skills .sugg-row .bar-wrap { flex: 1; max-width: 460px; background: var(--bg); border-radius: 5px; height: 10px; overflow: hidden; }
+  .skills .sugg-row .bar { display: block; height: 100%; background: #059669; }
+  .skills .sugg-row .bar.neg { background: #b91c1c; }
+  .skills .sugg-row .nums { flex: 0 0 190px; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; font-size: 12.5px; }
+  .skills .caveat { border-left: 3px solid var(--pred); padding: 8px 12px; background: #fff8ed; border-radius: 0 8px 8px 0; font-size: 12.5px; }
+</style>
+</head>
+<body>
+
+<main class="skills">
+  <section class="panel">
+    <h1 id="head">Skill suggestions</h1>
+    <div class="meta-row" id="meta"></div>
+    <div id="worker-tokens"></div>
+  </section>
+
+  <section class="panel">
+    <div class="controls">
+      <label>Model (DenseRec runs)
+        <select id="model-sel"></select></label>
+      <label>Target job title
+        <input id="target" type="text" style="min-width:260px"></label>
+      <label>Top-K
+        <input id="top-k" type="number" min="1" max="100" value="10" style="width:70px"></label>
+      <label title="How many candidate skills to score (vocabulary frequency
+             order). Blank or 0 scores every trained skill — exact, but a few
+             chunked forward passes slower.">Candidate limit
+        <input id="limit" type="number" min="0" placeholder="all" style="width:90px"></label>
+      <button id="run" class="primary">Suggest skills</button>
+    </div>
+    <p class="hint">Each candidate skill is added to the worker's skill
+       preamble and the whole ranking is recomputed — the exact model forward,
+       no approximation. The delta is how much the target title's probability
+       moves; positive means the skill lifts this role up the ranking.</p>
+    <div id="out"><p class="hint">Pick a target title and hit <b>Suggest skills</b>.</p></div>
+    <p class="caveat"><b>Read these as skills <i>associated</i> with the
+       role.</b> Deltas are correlational — workers listing a skill get the
+       title ranked higher — not causal. Adding the skill to a real profile is
+       not guaranteed to cause the outcome.</p>
+  </section>
+</main>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const short = (t) => t.includes(':') ? t.split(/:(.*)/)[1] : t;
+const tokType = (t) => t.includes(':') ? t.split(':')[0] : t;
+
+(async function init() {
+  const key = decodeURIComponent(location.hash.slice(1));
+  const payload = JSON.parse(localStorage.getItem(key) || 'null');
+  if (!payload) {
+    $('#out').innerHTML = '<p class="warn">No worker payload — open this page ' +
+      'from a worker\'s “skills” button on the main demo.</p>';
+    return;
+  }
+  $('#head').textContent = `Skill suggestions — ${payload.label || 'worker'}`;
+  $('#worker-tokens').innerHTML = (payload.tokens || [])
+    .map(t => `<span class="tok ${tokType(t)}">${t}</span>`).join('');
+  $('#meta').innerHTML = `<span>${(payload.tokens || []).length} resume tokens</span>
+    ${payload.target ? `<span>held-out next role: <b>${short(payload.target)}</b></span>` : ''}`;
+  if (payload.target) $('#target').value = short(payload.target);
+
+  // DenseRec runs only — the method needs the DenseRec ranking plumbing
+  const status = await (await fetch('/api/status')).json();
+  const dense = Object.values(status.models)
+    .filter(m => m.loaded && m.architecture === 'denserec')
+    .sort((a, b) => (b.start_time || 0) - (a.start_time || 0));
+  const sel = $('#model-sel');
+  sel.innerHTML = dense.map(m =>
+    `<option value="${m.run_id}">${m.experiment ? `[${m.experiment}] ` : ''}${m.label}</option>`).join('');
+  if (!dense.length) {
+    $('#out').innerHTML = '<p class="warn">No DenseRec runs loaded — skill ' +
+      'suggestions need the DenseRec ranking plumbing.</p>';
+    $('#run').disabled = true;
+    return;
+  }
+  if (payload.model && dense.some(m => m.run_id === payload.model)) {
+    sel.value = payload.model;
+  }
+
+  $('#run').onclick = async () => {
+    const target = 'W_TITLE:' + $('#target').value.trim().toLowerCase();
+    $('#run').disabled = true;
+    $('#out').innerHTML = '<p class="hint">Scoring every candidate skill through ' +
+      'the model (chunked forward passes) — this takes a little while…</p>';
+    try {
+      const res = await fetch('/api/suggest_skills', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: sel.value, tokens: payload.tokens, target,
+          top_k: parseInt($('#top-k').value || '10', 10),
+          limit: parseInt($('#limit').value || '0', 10) || 0,
+        }),
+      });
+      const data = await res.json();
+      if (data.error) { $('#out').innerHTML = `<p class="warn">${data.error}</p>`; return; }
+      const maxAbs = Math.max(1e-9, ...data.suggestions.map(s => Math.abs(s.delta)));
+      $('#out').innerHTML = `
+        <p class="baseline">Baseline: “${short(target)}” ranks
+          <b>#${data.baseline_rank}</b> for this worker
+          <span class="hint">· ${data.n_candidates.toLocaleString()} candidate
+          skills scored · ${data.label}</span></p>
+        ${data.suggestions.map(s => `
+          <div class="sugg-row">
+            <span class="skill tok S_SKILL" title="${s.skill}">${short(s.skill)}</span>
+            <span class="bar-wrap"><span class="bar${s.delta < 0 ? ' neg' : ''}"
+              style="width:${Math.max(2, 100 * Math.abs(s.delta) / maxAbs)}%"></span></span>
+            <span class="nums">${s.delta >= 0 ? '+' : ''}${(s.delta * 100).toFixed(3)}pp
+              → rank #${s.new_rank}</span>
+          </div>`).join('')}`;
+    } finally {
+      $('#run').disabled = false;
+    }
+  };
+})();
+</script>
+</body>
+</html>

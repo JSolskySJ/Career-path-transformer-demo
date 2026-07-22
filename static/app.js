@@ -353,7 +353,8 @@ function renderResumeSource() {
     const opt = document.createElement('option');
     opt.value = r.run_id;
     const date = runDate(r);
-    opt.textContent = `${r.label}${date ? ' · ' + date : ''} (${r.run_id.slice(0, 8)})`
+    const code = r.experiment ? `[${r.experiment}] ` : '';
+    opt.textContent = `${code}${r.label}${date ? ' · ' + date : ''} (${r.run_id.slice(0, 8)})`
       + (r.has_samples ? '' : ' — no resumes');
     sel.appendChild(opt);
   }
@@ -454,8 +455,21 @@ function renderSampleList() {
       (state.selectedSample && state.selectedSample.id === s.id ? ' selected' : '');
     const nSkills = s.context_tokens.filter(t => t.startsWith('S_SKILL:')).length;
     const skills = nSkills ? `<span class="skill-count" title="${nSkills} skills">🛠${nSkills}</span>` : '';
-    div.innerHTML = `<span>${s.label}</span><span class="tags">${skills}<span class="cat">${s.category.replace('_', ' ')}</span></span>`;
+    div.innerHTML = `<span>${s.label}</span><span class="tags">${skills}
+      <button class="icon skill-suggest" title="Counterfactual skill suggestions:
+      which skills, added to this worker, most improve a target role's ranking
+      (DenseRec)">💡 skills</button>
+      <span class="cat">${s.category.replace('_', ' ')}</span></span>`;
     div.onclick = () => { state.selectedSample = s; renderSampleList(); onResumeChanged(); };
+    div.querySelector('.skill-suggest').onclick = (e) => {
+      e.stopPropagation();                    // don't also select the row
+      const key = `cpt_skills_${state.resumeRun}_${s.id}`;
+      localStorage.setItem(key, JSON.stringify({
+        tokens: s.context_tokens, target: s.target, label: s.label,
+        model: state.resumeRun,
+      }));
+      window.open('/skills#' + encodeURIComponent(key), '_blank');
+    };
     list.appendChild(div);
   }
 }
@@ -781,7 +795,10 @@ function renderPredictions() {
       ? `<span class="hint">R@10 ${info.metrics.test_recall_at_10.toFixed(3)}</span>` : '';
     let html = `<h3>${info.experiment ? `<span class="exp-badge">${info.experiment}</span> ` : ''}${name}
       ${date ? `<span class="run-date">${date}</span>` : ''} ${r10}
-      <span class="hint">(${scoreLabel}${nRanked})</span></h3>`;
+      <span class="hint">(${scoreLabel}${nRanked})</span>
+      <a class="model-internals" href="#" data-run="${rid}"
+         title="Model internals with THIS resume loaded — drill into any of its
+         predicted titles">internals ↗</a></h3>`;
     html += senseHtml(r, target);
     html += confidenceHtml(r.confidence);
     html += '<div class="pred-list">';
@@ -816,6 +833,18 @@ function renderPredictions() {
       row.title = 'Click to inspect what the model is doing for this title (new tab)';
       row.onclick = () => openInspect(rid, r.predictions[i].token);
     });
+    // Model internals seeded with THIS prediction's resume — the drill-down
+    // there lists this resume's top titles for per-title traces.
+    const link = card.querySelector('.model-internals');
+    if (link) link.onclick = (e) => {
+      e.preventDefault();
+      const key = `cpt_model_${rid}`;
+      localStorage.setItem(key, JSON.stringify({
+        model: rid, label: info.label || name,
+        tokens: state.lastPrediction.tokens, target: state.lastPrediction.target,
+      }));
+      window.open('/inspect#' + encodeURIComponent(key), '_blank');
+    };
     box.appendChild(card);
   }
 

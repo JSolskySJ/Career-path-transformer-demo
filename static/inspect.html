@@ -578,24 +578,37 @@ function renderModelStatic(data, payload) {
     });
   }
 
-  // Drill down: pick a held-out resume → its top predictions → per-title trace
+  // Drill down: a resume → its top predictions → per-title trace. When the
+  // page was opened from a prediction card, THAT resume is loaded first (the
+  // inner workings of the prediction just made); the run's held-out samples
+  // are selectable alternatives.
+  const fromPrediction = !!(payload.tokens && payload.tokens.length);
   const drill = section(box, 'Drill down to one recommendation',
-    'pick a held-out resume, then click a predicted title to trace exactly how ' +
-    'this model produced it — attention arithmetic, per-token influence, the lot.');
+    (fromPrediction
+      ? 'loaded with the resume you just predicted — click a predicted title '
+      : 'pick a held-out resume, then click a predicted title ') +
+    'to trace exactly how this model produced it — attention arithmetic, ' +
+    'per-token influence, the lot.');
   drill.innerHTML = `<p>Resume: <select id="drill-sample"><option>loading…</option></select></p>
     <div id="drill-preds" class="hint">pick a resume to see its top predictions</div>`;
   (async () => {
     const s = await (await fetch('/api/samples?run=' + encodeURIComponent(data.model))).json();
+    const options = [];
+    if (fromPrediction) {
+      options.push({ label: '★ this prediction’s resume',
+                     context_tokens: payload.tokens, target: payload.target });
+    }
+    options.push(...s.samples);
     const sel = $('#drill-sample');
-    if (!s.samples.length) {
+    if (!options.length) {
       sel.outerHTML = '<span class="hint">no sample resumes staged for this run — ' +
         'use “Build from dataset” on the main page first</span>';
       return;
     }
-    sel.innerHTML = s.samples.map((x, i) =>
+    sel.innerHTML = options.map((x, i) =>
       `<option value="${i}">${x.label}</option>`).join('');
     async function drillPredict(i) {
-      const sample = s.samples[i];
+      const sample = options[i];
       $('#drill-preds').textContent = 'predicting…';
       const res = await (await fetch('/api/predict', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
