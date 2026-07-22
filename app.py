@@ -366,34 +366,79 @@ def skills_page():
     return send_from_directory('static', 'skills.html')
 
 
+_MASKED_LM = ('denserec', 'bert4rec', 'modernbert')   # item2vec has no [MASK]
+
+
+def _masked_lm_run(rid):
+    r = RUNS.get(rid)
+    if r is None or r['model'] is None:
+        return None, (jsonify({'error': f'{rid} not loaded'}), 400)
+    if r['architecture'] not in _MASKED_LM:
+        return None, (jsonify({'error': 'skill suggestions need a masked-LM '
+                                        'run (bert4rec / modernbert / '
+                                        'denserec)'}), 400)
+    return r, None
+
+
 @app.route('/api/suggest_skills', methods=['POST'])
 def suggest_skills():
-    """Top-k skills whose addition most improves the target title's rank.
-    DenseRec runs only. Brute force over the skill vocabulary — slow-ish
-    (a few chunked forward passes), so the page shows progress copy."""
+    """Two-stage counterfactual skill suggestions, live on the demo's own
+    staged model: fast Bayes-ratio pass over every skill, exact verification
+    of the top-k."""
     payload = request.get_json(force=True)
     rid = payload.get('model', '')
-    r = RUNS.get(rid)
-    if r is None:
-        return jsonify({'error': f'unknown run {rid}'}), 400
+    r, err = _masked_lm_run(rid)
+    if err:
+        return err
     tokens = payload.get('tokens') or []
     target = payload.get('target', '')
     if not tokens or not target:
         return jsonify({'error': 'tokens and target are required'}), 400
     try:
-        from demo.skills import suggest
-        result = suggest(rid, r, tokens, target,
+        from demo.skill_suggestion import suggest
+        result = suggest(r['model'], rid, tokens, target,
                          top_k=int(payload.get('top_k', 10)),
                          alpha=float(payload.get('alpha', 0.9)),
                          min_count=int(payload.get('min_count', 50)))
-    except (ValueError, FileNotFoundError) as e:
+    except ValueError as e:
         return jsonify({'error': str(e)}), 400
     except Exception as e:
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
-    result['model'] = rid
-    result['label'] = r['label']
-    result['experiment'] = r.get('experiment')
+    result.update({'model': rid, 'label': r['label'],
+                   'experiment': r.get('experiment')})
+    return jsonify(result)
+
+
+@app.route('/api/skill_eval', methods=['POST'])
+def skill_eval():
+    """Live evaluation of the skill scorer on this run's held-out resumes —
+    LOSO vs baselines, genericity, cross-title, fidelity vs exact, gates."""
+    payload = request.get_json(force=True)
+    rid = payload.get('model', '')
+    r, err = _masked_lm_run(rid)
+    if err:
+        return err
+    if not r['samples_path']:
+        return jsonify({'error': 'no sample resumes staged for this run — '
+                                 'build them from the dataset first'}), 400
+    with open(r['samples_path']) as f:
+        samples = json.load(f)
+    try:
+        from demo.skill_suggestion import live_eval
+        result = live_eval(
+            r['model'], rid, samples,
+            n=max(5, min(int(payload.get('n', 30)), 150)),
+            alpha=float(payload.get('alpha', 0.9)),
+            min_count=int(payload.get('min_count', 50)),
+            n_fidelity=max(0, min(int(payload.get('n_fidelity', 5)), 20)))
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+    result.update({'model': rid, 'label': r['label'],
+                   'experiment': r.get('experiment')})
     return jsonify(result)
 
 

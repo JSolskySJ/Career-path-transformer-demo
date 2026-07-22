@@ -44,7 +44,7 @@
 
   <section class="panel">
     <div class="controls">
-      <label>Model (DenseRec runs)
+      <label>Model (masked-LM runs)
         <select id="model-sel"></select></label>
       <label title="Only titles this model can actually recommend (its ranking
              domain) — start typing to search them">Target job title
@@ -69,6 +69,30 @@
        move into this role.</b> Lifts and deltas are correlational — workers
        listing a skill get the title ranked higher — not causal. Adding the
        skill to a real profile is not guaranteed to cause the outcome.</p>
+  </section>
+
+  <section class="panel">
+    <details id="eval-box">
+      <summary style="cursor:pointer; font-weight:600">Live evaluation
+        <span class="hint">— how trustworthy is this scorer? Runs the
+        fidelity/bias suite on this model's held-out resumes, right here</span>
+      </summary>
+      <div class="controls" style="margin-top:10px">
+        <label title="Held-out (worker, next-title) pairs sampled for the eval">
+          Pairs <input id="eval-n" type="number" min="5" max="150" value="30" style="width:70px"></label>
+        <label title="Pairs given the slow exact brute-force reference —
+               drives fidelity + self-consistency; the expensive part">
+          Fidelity pairs <input id="eval-nf" type="number" min="0" max="20" value="5" style="width:70px"></label>
+        <button id="eval-run" class="primary">Run evaluation</button>
+      </div>
+      <p class="hint">Baselines: <b>B1</b> global skill popularity ·
+         <b>B2</b> title–skill co-occurrence (no model) · <b>B3</b> raw
+         P(s | ctx, T) (no denominator) · <b>B4</b> the shipped lift.
+         LOSO = remove one skill a worker actually holds, check each method
+         re-suggests it. Co-occurrence here is built from the sampled pairs
+         (proxy for training counts).</p>
+      <div id="eval-out"></div>
+    </details>
   </section>
 </main>
 
@@ -125,17 +149,17 @@ const tokType = (t) => t.includes(':') ? t.split(':')[0] : t;
     $('#worker-profile-box').style.display = 'none';
   }
 
-  // DenseRec runs only — the method needs the DenseRec ranking plumbing
+  // Masked-LM runs only (bert4rec / modernbert / denserec) — item2vec has no
+  // [MASK] to read a skill distribution from.
   const status = await (await fetch('/api/status')).json();
   const dense = Object.values(status.models)
-    .filter(m => m.loaded && m.architecture === 'denserec')
+    .filter(m => m.loaded && ['denserec', 'bert4rec', 'modernbert'].includes(m.architecture))
     .sort((a, b) => (b.start_time || 0) - (a.start_time || 0));
   const sel = $('#model-sel');
   sel.innerHTML = dense.map(m =>
     `<option value="${m.run_id}">${m.experiment ? `[${m.experiment}] ` : ''}${m.label}</option>`).join('');
   if (!dense.length) {
-    $('#out').innerHTML = '<p class="warn">No DenseRec runs loaded — skill ' +
-      'suggestions need the DenseRec ranking plumbing.</p>';
+    $('#out').innerHTML = '<p class="warn">No masked-LM runs loaded.</p>';
     $('#run').disabled = true;
     return;
   }
@@ -198,6 +222,60 @@ const tokType = (t) => t.includes(':') ? t.split(':')[0] : t;
           </div>`).join('')}`;
     } finally {
       $('#run').disabled = false;
+    }
+  };
+
+  // ── Live evaluation ──────────────────────────────────────────────────────
+  $('#eval-run').onclick = async () => {
+    $('#eval-run').disabled = true;
+    $('#eval-out').innerHTML = '<p class="hint">Running — 2 fast passes per pair, ' +
+      'plus the exact brute-force reference on the fidelity pairs (the slow ' +
+      'bit, ~150 re-rankings each)…</p>';
+    try {
+      const res = await fetch('/api/skill_eval', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: sel.value,
+          n: parseInt($('#eval-n').value || '30', 10),
+          n_fidelity: parseInt($('#eval-nf').value || '5', 10),
+          min_count: parseInt($('#min-count').value || '50', 10),
+        }),
+      });
+      const d = await res.json();
+      if (d.error) { $('#eval-out').innerHTML = `<p class="warn">${d.error}</p>`; return; }
+      const pct = (x) => x === null || x === undefined ? '—' : (100 * x).toFixed(1) + '%';
+      const num = (x) => x === null || x === undefined ? '—' : x.toFixed(3);
+      const losoRow = (k, label) => `<tr><td>${label}</td>` +
+        ['B1', 'B2', 'B3', 'B4'].map(b =>
+          `<td${b === 'B4' ? ' style="font-weight:700"' : ''}>${
+            d.loso[b] ? num(d.loso[b][k]) : '—'}</td>`).join('') + '</tr>';
+      $('#eval-out').innerHTML = `
+        <p class="hint">${d.n_pairs} pairs · ${d.n_loso} LOSO ·
+           ${d.n_fidelity} fidelity · ${d.n_candidates.toLocaleString()}
+           candidate skills · ${d.label}</p>
+        <table class="kv" style="margin:8px 0">
+          <tr><th></th><th>B1 popularity</th><th>B2 co-occur</th>
+              <th>B3 P(s|ctx,T)</th><th>B4 lift (shipped)</th></tr>
+          ${losoRow('mrr', 'LOSO MRR')}
+          ${losoRow('hit10', 'LOSO Hit@10')}
+          <tr><td>genericity of top-10 (lower = better)</td><td>—</td><td>—</td>
+              <td>${num(d.genericity.B3)}</td>
+              <td style="font-weight:700">${num(d.genericity.B4)}</td></tr>
+        </table>
+        <table class="kv" style="margin:8px 0">
+          <tr><td>fidelity overlap@10 vs exact</td><td>${pct(d.fidelity.overlap10)}</td></tr>
+          <tr><td>fidelity Spearman vs exact</td><td>${num(d.fidelity.spearman)}</td></tr>
+          <tr><td>self-consistency win-rate</td><td>${pct(d.fidelity.self_consistency)}</td></tr>
+          <tr><td>cross-title top-10 Jaccard (lower = better)</td>
+              <td>${num(d.cross_title_jaccard)}</td></tr>
+        </table>
+        <p><b>Ship gates:</b></p>
+        ${Object.entries(d.gates).map(([g, ok]) =>
+          `<div>${ok ? '✅' : '❌'} ${g}</div>`).join('')}
+        <p class="hint">Co-occurrence is a proxy built from the sampled pairs —
+           the at-scale eval (datawarehouse-ai) uses real training counts.</p>`;
+    } finally {
+      $('#eval-run').disabled = false;
     }
   };
 })();
