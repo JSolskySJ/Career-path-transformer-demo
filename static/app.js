@@ -597,10 +597,15 @@ function renderResumeView() {
     const company = isWork && exp.company
       ? `<span class="company" title="Company">🏢 ${exp.company}</span>` : '';
     const specs = isWork ? chipRow(splitMulti(exp.spec), 'spec') : '';
+    // Freetext description (DenseRec W_DESC) — often long, so collapse it into
+    // a native dropdown instead of dumping it inline.
+    const desc = isWork && exp.description
+      ? `<details class="exp-desc"><summary>📄 description</summary>${exp.description}</details>`
+      : '';
     div.innerHTML = `
       <span class="badge">${isWork ? '💼' : '🎓'}</span>
       <span class="body"><b>${main}</b>${tenure}${company}<br>
-        <span class="meta">${meta}</span>${specs}</span>`;
+        <span class="meta">${meta}</span>${specs}${desc}</span>`;
     box.appendChild(div);
   }
   const t = document.createElement('p');

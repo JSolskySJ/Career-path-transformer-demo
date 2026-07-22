@@ -196,13 +196,45 @@ def inspect_bert4rec(m, tokens, title):
     if title_id is None:
         return {'error': f'{title} is not in this model\'s vocabulary'}
 
-    known = [t for t in tokens if t in vocab.str2idx]
-    if not known:
-        return {'error': 'no in-vocabulary context tokens'}
-    used = known[-(m._max_len - 1):]
-    ids = vocab.encode(used)
-    pad_n = m._max_len - 1 - len(ids)
-    seq = [vocab.pad_id] * pad_n + ids + [vocab.mask_id]
+    # DenseRec keeps renderable out-of-vocabulary tokens (e.g. W_DESC job
+    # descriptions) as content-injected positions instead of dropping them, so
+    # the inspector must analyse the SAME input the prediction used. _row builds
+    # the id sequence + the MiniLM injection for a context; plain models fall
+    # back to the in-vocab-only row.
+    is_dense = hasattr(m, '_context_row')
+
+    def _row(context):
+        """(seq ids, injection|None, used token-strings) for one context."""
+        if is_dense:
+            seq, injection, used, _injected, _unknown = m._context_row(context)
+            return seq, injection, used
+        kept = [t for t in context if t in vocab.str2idx][-(m._max_len - 1):]
+        p = m._max_len - 1 - len(kept)
+        return ([vocab.pad_id] * p + [vocab.str2idx[t] for t in kept]
+                + [vocab.mask_id]), None, kept
+
+    def _embed(ids_t, injection):
+        """Input embeddings with the DenseRec content injection applied — the
+        hook the capture forward embeds from."""
+        if is_dense and injection is not None:
+            model._unseen_stash = injection
+            try:
+                return model._input_embeddings(ids_t)
+            finally:
+                model._unseen_stash = None
+        return model.item_emb(ids_t)
+
+    def _mask_logits(ids_t, injection):
+        """Full-vocab [MASK] logits via the module's real forward (injection
+        included) — for the faithfulness-preserving ablation."""
+        out = (model(ids_t, unseen_content=injection) if is_dense
+               else model(ids_t))
+        return out[0, -1]
+
+    seq, injection, used = _row(tokens)
+    if not used:
+        return {'error': 'no usable context tokens'}
+    pad_n = m._max_len - 1 - len(used)
     ids_t = torch.tensor(seq).unsqueeze(0)
     kpm = ids_t == vocab.pad_id
     labels = [_short(t) for t in used] + ['[MASK]']
@@ -220,12 +252,13 @@ def inspect_bert4rec(m, tokens, title):
 
     model.eval()
     with torch.no_grad():
+        emb = _embed(ids_t, injection)
         if modern:
-            x = model.dropout(model.norm(model.item_emb(ids_t)))   # RoPE, no abs pos
+            x = model.dropout(model.norm(emb))                     # RoPE, no abs pos
             attn_bias = model._attn_bias(ids_t, x.dtype)
         else:
             pos = torch.arange(m._max_len)
-            x = model.dropout(model.norm(model.item_emb(ids_t) + model.pos_emb(pos)))
+            x = model.dropout(model.norm(emb + model.pos_emb(pos)))
         x0 = x
         # Residual-stream trace: (stage name, (1, L_full, d)) at every point in
         # the forward pass, so any token can be followed through the model.
@@ -252,9 +285,12 @@ def inspect_bert4rec(m, tokens, title):
                         for k, v in ffn.items()},
             })
         # The displayed internals must be the model's own numbers — the manual
-        # re-run is asserted against the module's real encoder output.
+        # re-run is asserted against the module's real encoder output (with the
+        # same content injection).
         final = model.final_norm(x) if modern else x
-        faithful = bool(torch.allclose(final, model._encode(ids_t), atol=1e-4))
+        real = (model.encode_with_injection(ids_t, injection) if is_dense
+                else model._encode(ids_t))
+        faithful = bool(torch.allclose(final, real, atol=1e-4))
 
         title_ids = m._title_ids
         layers = []
@@ -286,31 +322,38 @@ def inspect_bert4rec(m, tokens, title):
                 for j, t in enumerate(top)])
 
         # Leave-one-out influence: re-run the model with each context token
-        # removed (one batched forward) and measure the change in the clicked
-        # title's logit and in-domain probability. SIGNED and faithful:
-        # positive = the token pushes the prediction TOWARD this title,
-        # negative = it pushes it away.
-        variants = []
-        for j in range(len(ids)):
-            v = ids[:j] + ids[j + 1:]
-            variants.append([vocab.pad_id] * (m._max_len - 1 - len(v)) + v + [vocab.mask_id])
-        batch = torch.tensor([seq] + variants)
-        out = model(batch)[:, -1, :]                  # [MASK] logits per variant
-        dom = out[:, title_ids]
-        dom_probs = torch.softmax(dom, dim=-1)
+        # removed and measure the change in the clicked title's logit and
+        # in-domain probability. Ablation is over `used` (which includes any
+        # DenseRec-injected description token), removing one token at a time and
+        # re-encoding the variant WITH its injection — so a description's own
+        # influence is measured, not silently dropped. SIGNED: positive = the
+        # token pushes the prediction TOWARD this title, negative = away.
+        # Looped rather than batched because each variant carries a different
+        # injection tensor; the model is tiny so it stays instant.
+        def _dom(ids_t, inj):
+            return _mask_logits(ids_t, inj)[title_ids]
+
+        base_dom = _dom(ids_t, injection)
+        base_probs = torch.softmax(base_dom, dim=-1)
         t_pos = (title_ids == title_id).nonzero()
         t_col = int(t_pos[0, 0]) if len(t_pos) else None
-        base_logit = float(out[0, title_id])
-        base_prob = float(dom_probs[0, t_col]) if t_col is not None else None
+        base_logit = float(_mask_logits(ids_t, injection)[title_id])
+        base_prob = float(base_probs[t_col]) if t_col is not None else None
+        tok_rows = []
+        for j in range(len(used)):
+            v_seq, v_inj, _ = _row(used[:j] + used[j + 1:])
+            v_out = _mask_logits(torch.tensor(v_seq).unsqueeze(0), v_inj)
+            entry = {'i': j, 'delta_logit': round(base_logit - float(v_out[title_id]), 4)}
+            if t_col is not None:
+                v_prob = float(torch.softmax(v_out[title_ids], dim=-1)[t_col])
+                entry['delta_prob'] = round(base_prob - v_prob, 5)
+            else:
+                entry['delta_prob'] = None
+            tok_rows.append(entry)
         ablation = {
             'base_logit': round(base_logit, 4),
             'base_prob': round(base_prob, 5) if base_prob is not None else None,
-            'tokens': [{
-                'i': j,      # index into labels/token_types (context positions)
-                'delta_logit': round(base_logit - float(out[1 + j, title_id]), 4),
-                'delta_prob': (round(base_prob - float(dom_probs[1 + j, t_col]), 5)
-                               if t_col is not None else None),
-            } for j in range(len(ids))],
+            'tokens': tok_rows,
         }
 
     return {

@@ -199,6 +199,11 @@ button.icon { padding: 4px 8px; font-size: 12px; }
   vertical-align: middle;
 }
 .exp .company { color: var(--muted); background: #eef2f7; font-weight: 500; text-transform: capitalize; }
+.exp .exp-desc { margin-top: 4px; font-size: 12.5px; }
+.exp .exp-desc summary { cursor: pointer; color: var(--accent); }
+.exp .exp-desc[open] summary { margin-bottom: 3px; }
+.exp .exp-desc { color: var(--muted); }
+.exp .exp-desc[open] { white-space: pre-wrap; }
 
 /* Inline chips: specialisations on work entries, skills in the dropdown */
 .chips-inline { display: inline-flex; flex-wrap: wrap; gap: 4px; margin-top: 3px; }

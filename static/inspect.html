@@ -81,6 +81,11 @@
     <h1 id="head">Model inspector</h1>
     <div class="meta-row" id="meta"></div>
     <div id="resume-tokens"></div>
+    <p class="hint" id="topn-ctrl" style="margin-top:8px; display:none">
+      Show top <input id="top-n" type="number" min="1" placeholder="all"
+        style="width:64px"> tokens per influence list
+      <span class="hint">(blank = every token; ranked by magnitude)</span>
+    </p>
   </section>
   <section class="panel" id="content"><p class="hint">Loading model internals…</p></section>
 </main>
@@ -235,6 +240,7 @@ function renderBert4rec(data) {
        prediction TOWARD the title, red = away). Numbers: Δlogit · Δprobability.
        Baseline logit ${ab.base_logit.toFixed(3)}${ab.base_prob !== null
          ? `, in-domain prob ${(ab.base_prob * 100).toFixed(2)}%` : ''}.`);
+    infl.classList.add('token-influence');
     const maxAbs = Math.max(1e-9, ...ab.tokens.map(t => Math.abs(t.delta_logit)));
     const order = [...ab.tokens].sort((a, b) => b.delta_logit - a.delta_logit);
     infl.innerHTML = order.map(t => `
@@ -260,6 +266,7 @@ function renderBert4rec(data) {
        would place it somewhere training never put its ID. Note: this trace is
        the in-vocab ID path — injected out-of-vocabulary tokens are scored by
        the model but not traced here.`);
+    al.classList.add('token-influence');
     const maxAbs = Math.max(1e-9, ...dr.alignment.map(r => Math.abs(r.cosine)));
     al.innerHTML = dr.alignment
       .slice().sort((a, b) => b.cosine - a.cosine)
@@ -345,7 +352,7 @@ function renderBert4rec(data) {
       const order = [...vw.keys()].sort((a, b) => vw[b] - vw[a]);
       const det = collapsible(enc,
         `[MASK] influence, sorted — attention (blue) vs value-weighted (red), ${L} positions`, true);
-      det.classList.add('mask-weights');
+      det.classList.add('mask-weights', 'token-influence');
       det.insertAdjacentHTML('beforeend', order.map(i => `
         <div class="contrib-row">
           <span class="tok ${data.token_types[i]}">${fullTokens[i]}</span>
@@ -443,6 +450,23 @@ function renderBert4rec(data) {
   document.title = `${short(payload.title)} — ${payload.label} — inspector`;
   if (data.architecture === 'item2vec') renderItem2vec(data);
   else renderBert4rec(data);
+
+  // Top-N control: cap every influence list to the top N rows by magnitude
+  // (rows are pre-sorted, so index = rank). Blank = all. Rows are hidden, not
+  // re-rendered, so it never re-plots the heatmaps.
+  function applyTopN() {
+    const n = parseInt($('#top-n').value, 10);
+    document.querySelectorAll('.token-influence').forEach(list => {
+      list.querySelectorAll('.contrib-row').forEach((row, i) => {
+        row.style.display = (!n || i < n) ? '' : 'none';
+      });
+    });
+  }
+  const ctrl = $('#topn-ctrl');
+  if (document.querySelector('.token-influence')) {
+    ctrl.style.display = '';
+    $('#top-n').oninput = applyTopN;
+  }
 })();
 </script>
 </body>
