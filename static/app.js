@@ -675,6 +675,7 @@ async function predict() {
       }),
     });
     state.lastPrediction = await res.json();
+    renderFlowStrip();
     renderPredictions();
     const oov = new Set();
     for (const r of Object.values(state.lastPrediction.results)) {
@@ -685,6 +686,41 @@ async function predict() {
   } finally {
     $('#predict-btn').disabled = false;
   }
+}
+
+// Input → model → output at a glance, above the prediction columns — the
+// data flow an exec can read without knowing what a token is.
+function renderFlowStrip() {
+  const { tokens, results } = state.lastPrediction;
+  const strip = $('#flow-strip');
+  const nExp = tokens.filter(t => t.startsWith('W_TITLE:')).length;
+  const nEdu = tokens.filter(t => t.startsWith('E_')).length;
+  const nSkill = tokens.filter(t => t.startsWith('S_SKILL:')).length;
+  const models = Object.values(results).filter(r => !r.error);
+  const topK = parseInt($('#top-k').value || '10', 10);
+  const domains = [...new Set(models.map(r => r.n_ranked).filter(Boolean))]
+    .map(n => n.toLocaleString()).join(' / ');
+  strip.classList.remove('hidden');
+  strip.innerHTML = `
+    <div class="flow-node">
+      <div class="flow-label">Input · one career</div>
+      <div class="flow-value">${nExp} role${nExp === 1 ? '' : 's'}${
+        nEdu ? ` · ${nEdu} education` : ''}${
+        nSkill ? ` · ${nSkill} skills` : ''}</div>
+      <div class="flow-sub">${tokens.length} tokens the model reads</div>
+    </div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-node model">
+      <div class="flow-label">Model${models.length === 1 ? '' : 's'}</div>
+      <div class="flow-value">${models.length} run${models.length === 1 ? '' : 's'} compared</div>
+      <div class="flow-sub">${domains ? `ranking ${domains} titles` : ''}</div>
+    </div>
+    <div class="flow-arrow">→</div>
+    <div class="flow-node">
+      <div class="flow-label">Output</div>
+      <div class="flow-value">top ${topK} next roles</div>
+      <div class="flow-sub">click any title to see why</div>
+    </div>`;
 }
 
 // The target's rank in one model's ranking, as a per-column header banner —
