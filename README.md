@@ -1,10 +1,22 @@
 # Career Path Transformer — Demo
 
-Local web app for sense-checking the career-path models (**item2vec** and
-**BERT4Rec**). Select a real held-out resume or build one by hand, run it
-through both models, compare the predicted next job titles, and explore a 2-D
-map of where the resume's job-title / education vectors sit in each model's
-embedding space.
+Local web app for exploring the career-path models (**item2vec**,
+**BERT4Rec**, **ModernBERT**, **DenseRec**). Select a real held-out resume or
+build one by hand, run it through the staged model runs side by side, compare
+the predicted next job titles, and explore a 2-D map of where the resume's
+job-title / education vectors sit in each model's embedding space.
+
+Three top-level views: **Predict** (input → model → output, with per-model
+drill-down), **Job title flow** (empirical transition Sankey), and **Dataset**
+(the raw held-out slice of each run's training data — filterable, columns can
+be hidden and drag-reordered).
+
+Clicking any predicted title opens the **model inspector** in a new tab: the
+logit lens, leave-one-out per-token influence, and every encoder block in
+forward-pass order — per-head learned weights, the attention arithmetic step
+by step (Q, K, scores = QKᵀ/√d, softmax, V, head output, on the actual data),
+attention patterns, [MASK] influence, FFN weights, and a residual-stream trace
+of every token. All sections are collapsible.
 
 ![architecture](https://img.shields.io/badge/python-3.11%20(dwh--ai--py311)-blue)
 
