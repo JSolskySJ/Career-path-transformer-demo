@@ -55,41 +55,47 @@ def _load(run_id, run_entry):
     with open(vocab_path) as f:
         vocab = Vocab.from_idx2str(json.load(f)['idx2str'])
 
+    from models.career_path_skill_suggestion import make_ranker_shell
     params = run_entry.get('params', {})
-    shell = CareerPathDenseRecModel.__new__(CareerPathDenseRecModel)
-    shell._max_len = int(params.get('max_len', 64) or 64)
-    shell._anchored_positions = str(params.get(
-        'anchored_positions', 'False')).strip().lower() in ('true', '1', 'yes')
-    shell._unseen_catch_all = str(params.get(
-        'unseen_catch_all', 'True')).strip().lower() in ('true', '1', 'yes')
-    shell._unseen_vector_cache = {}
+    _bool = lambda v, d: str(v if v is not None else d).strip().lower() \
+        in ('true', '1', 'yes')
     # Rank over the same domain the demo displays for this run, so the
     # baseline rank here matches the prediction panel.
     demo_model = run_entry.get('model')
-    shell._sj_title_set = (set(demo_model.title_vocab)
-                           if demo_model is not None and
-                           getattr(demo_model, 'restricted', False) else None)
+    sj = (set(demo_model.title_vocab) if demo_model is not None and
+          getattr(demo_model, 'restricted', False) else None)
+    shell = make_ranker_shell(
+        vocab, max_len=int(params.get('max_len', 64) or 64),
+        anchored_positions=_bool(params.get('anchored_positions'), 'False'),
+        unseen_catch_all=_bool(params.get('unseen_catch_all'), 'True'),
+        sj_title_set=sj)
     _CACHE[run_id] = (shell, (module, vocab))
     return _CACHE[run_id]
 
 
-def suggest(run_id, run_entry, tokens, target, top_k=10, limit=0):
-    """Top-k skills whose addition most improves ``target``'s rank for this
-    context. limit > 0 prunes the candidate set (by vocab frequency order)
-    for a faster pass; 0 scores every trained skill."""
+def suggest(run_id, run_entry, tokens, target, top_k=10, alpha=0.9,
+            min_count=50):
+    """Two-stage per spec: the fast Bayes-ratio scorer picks the top-k
+    candidates (2 forward passes over ALL skills), then the exact brute force
+    verifies just those k (+1 baseline) so every number shown is an exact
+    model output. Returns lift + verified rank movement per skill."""
     shell, mv = _load(run_id, run_entry)
-    _, vocab = mv
-    candidates = None
-    if limit:
-        skills = [t for t in vocab.idx2str if t.startswith('S_SKILL:')]
-        candidates = skills[:limit]
-    base_rank, rows = shell.suggest_skills(
-        mv, list(tokens), target, top_k=top_k, candidates=candidates)
-    n_scored = len(candidates) if candidates is not None else \
-        sum(1 for t in vocab.idx2str if t.startswith('S_SKILL:'))
+    module, vocab = mv
+    from models.career_path_skill_suggestion import (
+        skill_delta_exact, suggest_skills_fast, _skill_ids)
+    fast = suggest_skills_fast(
+        module, vocab, list(tokens), target, top_k=top_k, alpha=alpha,
+        min_train_count=min_count, anchored=shell._anchored_positions)
+    base_rank, base_prob, exact = skill_delta_exact(
+        shell, mv, list(tokens), target, [s for s, _, _ in fast])
+    lifts = {s: (l, p) for s, l, p in fast}
     return {
         'baseline_rank': base_rank,
-        'n_candidates': n_scored,
-        'suggestions': [{'skill': s, 'delta': round(d, 6), 'new_rank': r}
-                        for s, d, r in rows],
+        'baseline_prob': round(base_prob, 6),
+        'n_candidates': len(_skill_ids(vocab, min_count)),
+        # exact order (verified deltas) — the fast path only chose candidates
+        'suggestions': [{'skill': s, 'delta': round(d, 6), 'new_rank': r,
+                         'lift': round(lifts[s][0], 2),
+                         'p_given_t': round(lifts[s][1], 6)}
+                        for s, d, r in exact],
     }

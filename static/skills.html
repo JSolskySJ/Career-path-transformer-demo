@@ -15,7 +15,8 @@
   .skills .controls label { display: flex; flex-direction: column; gap: 3px; font-size: 12.5px; color: var(--muted); }
   .skills .baseline { font-size: 14px; margin: 10px 0; }
   .skills .sugg-row { display: flex; align-items: center; gap: 10px; padding: 5px 0; }
-  .skills .sugg-row .skill { flex: 0 0 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .skills .sugg-row .skill { flex: 0 0 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .skills .sugg-row .lift { flex: 0 0 56px; text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .skills .sugg-row .bar-wrap { flex: 1; max-width: 460px; background: var(--bg); border-radius: 5px; height: 10px; overflow: hidden; }
   .skills .sugg-row .bar { display: block; height: 100%; background: #059669; }
   .skills .sugg-row .bar.neg { background: #b91c1c; }
@@ -52,22 +53,22 @@
         <datalist id="title-options"></datalist></label>
       <label>Top-K
         <input id="top-k" type="number" min="1" max="100" value="10" style="width:70px"></label>
-      <label title="How many candidate skills to score (vocabulary frequency
-             order). Blank or 0 scores every trained skill — exact, but a few
-             chunked forward passes slower.">Candidate limit
-        <input id="limit" type="number" min="0" placeholder="all" style="width:90px"></label>
+      <label title="Rare-skill guard: candidates must appear at least this many
+             times in training (rare skills produce unstable lift ratios)">Min frequency
+        <input id="min-count" type="number" min="0" value="50" style="width:80px"></label>
       <button id="run" class="primary">Suggest skills</button>
     </div>
-    <p class="hint">What happens if this worker adds <b>one</b> skill? Each
-       candidate skill is added to the skill list above (one at a time) and the
-       whole ranking is recomputed — the exact model forward, no approximation.
-       The delta is how much the target title's probability moves; positive
-       means that single skill lifts this role up the ranking.</p>
+    <p class="hint">What happens if this worker adds <b>one</b> skill? A fast
+       two-pass scorer ranks every trained skill by how much more likely it is
+       for workers who move into the target role (the lift), then the top
+       candidates are <b>verified exactly</b>: each one is added to the skill
+       list above and the whole ranking recomputed with the real model forward
+       — the rank movement shown is an exact model output.</p>
     <div id="out"><p class="hint">Pick a target title and hit <b>Suggest skills</b>.</p></div>
-    <p class="caveat"><b>Read these as skills <i>associated</i> with the
-       role.</b> Deltas are correlational — workers listing a skill get the
-       title ranked higher — not causal. Adding the skill to a real profile is
-       not guaranteed to cause the outcome.</p>
+    <p class="caveat"><b>These are skills <i>associated</i> with workers who
+       move into this role.</b> Lifts and deltas are correlational — workers
+       listing a skill get the title ranked higher — not causal. Adding the
+       skill to a real profile is not guaranteed to cause the outcome.</p>
   </section>
 </main>
 
@@ -170,7 +171,7 @@ const tokType = (t) => t.includes(':') ? t.split(':')[0] : t;
         body: JSON.stringify({
           model: sel.value, tokens: payload.tokens, target,
           top_k: parseInt($('#top-k').value || '10', 10),
-          limit: parseInt($('#limit').value || '0', 10) || 0,
+          min_count: parseInt($('#min-count').value || '50', 10),
         }),
       });
       const data = await res.json();
@@ -180,14 +181,20 @@ const tokType = (t) => t.includes(':') ? t.split(':')[0] : t;
         <p class="baseline">Baseline: “${short(target)}” ranks
           <b>#${data.baseline_rank}</b> for this worker
           <span class="hint">· ${data.n_candidates.toLocaleString()} candidate
-          skills scored · ${data.label}</span></p>
+          skills scored (fast pass) · top ${data.suggestions.length} verified
+          exactly · ${data.label}</span></p>
         ${data.suggestions.map(s => `
           <div class="sugg-row">
             <span class="skill tok S_SKILL" title="${s.skill}">${short(s.skill)}</span>
+            <span class="lift" title="How much more likely this skill is for
+              workers who move into the target role (Bayes-ratio lift)">
+              ${s.lift.toFixed(1)}×</span>
             <span class="bar-wrap"><span class="bar${s.delta < 0 ? ' neg' : ''}"
               style="width:${Math.max(2, 100 * Math.abs(s.delta) / maxAbs)}%"></span></span>
-            <span class="nums">${s.delta >= 0 ? '+' : ''}${(s.delta * 100).toFixed(3)}pp
-              → rank #${s.new_rank}</span>
+            <span class="nums" title="Exact verified change: target probability
+              delta and rank movement when only this skill is added">
+              ${s.delta >= 0 ? '+' : ''}${(s.delta * 100).toFixed(3)}pp ·
+              #${data.baseline_rank} → #${s.new_rank}</span>
           </div>`).join('')}`;
     } finally {
       $('#run').disabled = false;

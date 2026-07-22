@@ -384,7 +384,8 @@ def suggest_skills():
         from demo.skills import suggest
         result = suggest(rid, r, tokens, target,
                          top_k=int(payload.get('top_k', 10)),
-                         limit=int(payload.get('limit', 0)))
+                         alpha=float(payload.get('alpha', 0.9)),
+                         min_count=int(payload.get('min_count', 50)))
     except (ValueError, FileNotFoundError) as e:
         return jsonify({'error': str(e)}), 400
     except Exception as e:
