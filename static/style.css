@@ -650,3 +650,12 @@ table.kv td:first-child { color: var(--muted); font-family: ui-monospace, Menlo,
 #input-panel { padding-bottom: 26px; }
 .pred-list .score, .contrib-row .score, .run-date, .exp-badge { white-space: nowrap; }
 .model-row label { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+
+/* Explicit per-title drill affordance — the row is clickable everywhere, the
+   chip just makes that visible. Kept out of the aligned grid columns. */
+.pred-row .why {
+  flex: 0 0 auto; font-size: 10.5px; font-weight: 700; color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  border-radius: 8px; padding: 0 6px; opacity: .55;
+}
+.pred-row.clickable:hover .why { opacity: 1; background: #e8f0fe; }

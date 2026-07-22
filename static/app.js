@@ -456,9 +456,9 @@ function renderSampleList() {
     const nSkills = s.context_tokens.filter(t => t.startsWith('S_SKILL:')).length;
     const skills = nSkills ? `<span class="skill-count" title="${nSkills} skills">🛠${nSkills}</span>` : '';
     div.innerHTML = `<span>${s.label}</span><span class="tags">${skills}
-      <button class="icon skill-suggest" title="Counterfactual skill suggestions:
-      which skills, added to this worker, most improve a target role's ranking
-      (DenseRec)">💡 skills</button>
+      <button class="icon skill-suggest" title="Skill suggestions: which skills,
+      added to this worker, most improve a target role's ranking (opens per-worker
+      page; DenseRec models)">💡</button>
       <span class="cat">${s.category.replace('_', ' ')}</span></span>`;
     div.onclick = () => { state.selectedSample = s; renderSampleList(); onResumeChanged(); };
     div.querySelector('.skill-suggest').onclick = (e) => {
@@ -814,6 +814,9 @@ function renderPredictions() {
           <span class="title">${title}${flags}${hit ? ' ✓' : ''}</span>
           <span class="bar-wrap"><span class="bar" style="width:${Math.max(3, 100 * p.score / max)}%"></span></span>
           <span class="score">${p.score.toFixed(4)}</span>
+          <span class="why" title="Trace exactly how this model produced this
+            title for this resume — per-token influence, attention arithmetic,
+            logit lens (new tab)">why?</span>
         </div>`;
     });
     if (r.injected_tokens && r.injected_tokens.length) {
