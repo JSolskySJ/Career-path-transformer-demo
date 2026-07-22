@@ -97,6 +97,14 @@
 <script>
 const $ = (sel) => document.querySelector(sel);
 
+// Plotly heatmaps laid out inside a closed <details> have zero width —
+// resize any plots in a section when it is opened.
+document.addEventListener('toggle', (e) => {
+  if (e.target.open) {
+    e.target.querySelectorAll('.js-plotly-plot').forEach(p => Plotly.Plots.resize(p));
+  }
+}, true);
+
 // Single-hue sequential ramp (attention weight = magnitude): surface → dark blue.
 const ATTN_SCALE = [[0, '#f8fafc'], [1, '#1e40af']];
 
@@ -498,14 +506,129 @@ function renderBert4rec(data) {
     'titles in the trace are exactly this projection.');
 }
 
+// ── Whole-model view (no prediction selected) ──────────────────────────────
+function renderModelStatic(data, payload) {
+  $('#head').innerHTML = `Model internals
+    ${data.experiment ? `<span class="exp-badge">${data.experiment}</span>` : ''}
+    <span class="hint">— ${data.label}</span>`;
+  $('#meta').innerHTML = `<span>model run: <code>${data.model}</code></span>
+    ${data.static && data.n_layers ? `<span>${data.n_layers} layers ·
+      ${data.n_heads} heads · d_model ${data.d_model}</span>` : ''}
+    <span>${(data.vocab_size || 0).toLocaleString()} vocabulary tokens</span>`;
+  const box = $('#content');
+  box.innerHTML = '';
+
+  if (data.note) {
+    box.insertAdjacentHTML('beforeend', `<p class="hint">${data.note}</p>`);
+  }
+
+  // Aggregate attention profile — the model as a whole
+  if (data.type_attention) {
+    const ta = data.type_attention;
+    const prof = section(box, 'Attention profile — the model as a whole',
+      `mean attention the [MASK] query pays to each token TYPE, averaged over
+       ${ta.n_resumes} held-out resumes — each head's job, independent of any
+       single resume. Rows are heads, columns token types.`);
+    ta.mean.forEach((heads, li) => {
+      prof.insertAdjacentHTML('beforeend', `<h4>encoder layer ${li + 1}</h4>`);
+      heat(prof.appendChild(document.createElement('div')), heads, {
+        ml: 70, mb: 40, text: true,
+        xaxis: { tickmode: 'array', tickvals: [...ta.types.keys()], ticktext: ta.types },
+        yaxis: { tickmode: 'array', tickvals: [...heads.keys()],
+                 ticktext: heads.map((_, h) => `head ${h + 1}`), autorange: 'reversed' },
+        hover: '%{y} → %{x}<br>mean attention %{z:.3f}<extra></extra>',
+        height: 60 + 44 * heads.length,
+      });
+    });
+  }
+
+  // Learned weights per layer/head (input-independent)
+  if (data.layers) {
+    const d = data.d_model;
+    const enc = section(box, 'Learned weights',
+      'the trained parameters of every block — what the model IS, before any resume goes in');
+    data.layers.forEach((layer, i) => {
+      const ldet = collapsible(enc, `<b>${layer.name}</b>`, i === 0);
+      layer.heads.forEach((W, h) => {
+        const hdet = collapsible(ldet, `head ${h + 1} — W_Q, W_K, W_V, W_Oᵀ`, false);
+        const grid = document.createElement('div');
+        grid.className = 'weights-grid';
+        hdet.appendChild(grid);
+        for (const [name, z] of [['W_Q', W.wq], ['W_K', W.wk], ['W_V', W.wv], ['W_Oᵀ', W.wo_t]]) {
+          const cell = document.createElement('div');
+          cell.innerHTML = `<p class="hint">${name}</p>`;
+          grid.appendChild(cell);
+          heat(cell.appendChild(document.createElement('div')), z, {
+            signed: true, ml: 40, mb: 30, height: 190,
+            hover: name + ' head-dim %{y} · model-dim %{x}<br>%{z:.3f}<extra></extra>',
+          });
+        }
+      });
+      const f = collapsible(ldet, `FFN weights — W₁ then W₂`, false);
+      for (const [name, z] of [['W₁', layer.ffn.w1], ['W₂', layer.ffn.w2]]) {
+        f.insertAdjacentHTML('beforeend', `<p class="hint">${name}</p>`);
+        heat(f.appendChild(document.createElement('div')), z, {
+          signed: true, ml: 44, mb: 30, height: name === 'W₁' ? 420 : 190,
+          hover: name + ' out %{y} · in %{x}<br>%{z:.3f}<extra></extra>',
+        });
+      }
+    });
+  }
+
+  // Drill down: pick a held-out resume → its top predictions → per-title trace
+  const drill = section(box, 'Drill down to one recommendation',
+    'pick a held-out resume, then click a predicted title to trace exactly how ' +
+    'this model produced it — attention arithmetic, per-token influence, the lot.');
+  drill.innerHTML = `<p>Resume: <select id="drill-sample"><option>loading…</option></select></p>
+    <div id="drill-preds" class="hint">pick a resume to see its top predictions</div>`;
+  (async () => {
+    const s = await (await fetch('/api/samples?run=' + encodeURIComponent(data.model))).json();
+    const sel = $('#drill-sample');
+    if (!s.samples.length) {
+      sel.outerHTML = '<span class="hint">no sample resumes staged for this run — ' +
+        'use “Build from dataset” on the main page first</span>';
+      return;
+    }
+    sel.innerHTML = s.samples.map((x, i) =>
+      `<option value="${i}">${x.label}</option>`).join('');
+    async function drillPredict(i) {
+      const sample = s.samples[i];
+      $('#drill-preds').textContent = 'predicting…';
+      const res = await (await fetch('/api/predict', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tokens: sample.context_tokens, target: sample.target,
+                               top_k: 10, models: [data.model] }),
+      })).json();
+      const r = res.results[data.model];
+      if (!r || r.error) { $('#drill-preds').textContent = r ? r.error : 'failed'; return; }
+      $('#drill-preds').innerHTML = r.predictions.map(p => `
+        <button class="ghost drill-title" data-title="${p.token}">
+          ${short(p.token)} <span class="hint">${(p.score * 100).toFixed(1)}%</span>
+        </button>`).join(' ');
+      document.querySelectorAll('.drill-title').forEach(btn => {
+        btn.onclick = () => {
+          const key = 'cpt_drill_' + btn.dataset.title;
+          localStorage.setItem(key, JSON.stringify({
+            tokens: sample.context_tokens, model: data.model, label: data.label,
+            title: btn.dataset.title, target: sample.target,
+          }));
+          location.hash = encodeURIComponent(key);
+          location.reload();
+        };
+      });
+    }
+    sel.onchange = (e) => drillPredict(+e.target.value);
+    drillPredict(0);
+  })();
+}
+
 (async function init() {
-  const key = location.hash.slice(1);
+  const key = decodeURIComponent(location.hash.slice(1));
   const payload = JSON.parse(localStorage.getItem(key) || 'null');
   if (!payload) {
     return fail('No inspection payload found — open this page by clicking a ' +
                 'predicted title in the demo (the payload is handed over per tab).');
   }
-  renderHeader(payload);
   const res = await fetch('/api/inspect', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -513,6 +636,12 @@ function renderBert4rec(data) {
   });
   const data = await res.json();
   if (data.error) return fail(data.error, data.not_displayable === true);
+  if (!payload.title) {
+    document.title = `${payload.label} — model internals`;
+    renderModelStatic(data, payload);
+    return;
+  }
+  renderHeader(payload);
   document.title = `${short(payload.title)} — ${payload.label} — inspector`;
   if (data.architecture === 'item2vec') renderItem2vec(data);
   else renderBert4rec(data);
@@ -533,14 +662,6 @@ function renderBert4rec(data) {
     ctrl.style.display = '';
     $('#top-n').oninput = applyTopN;
   }
-
-  // Plotly heatmaps laid out inside a closed <details> have zero width —
-  // resize any plots in a section when it is opened.
-  document.addEventListener('toggle', (e) => {
-    if (e.target.open) {
-      e.target.querySelectorAll('.js-plotly-plot').forEach(p => Plotly.Plots.resize(p));
-    }
-  }, true);
 })();
 </script>
 </body>

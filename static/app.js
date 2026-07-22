@@ -12,6 +12,7 @@ const state = {
   selectedModels: new Set(),   // run_ids used for prediction
   // model-list date filter — default: only runs trained in the last 14 days
   modelDateCutoff: new Date(Date.now() - 14 * 864e5).toISOString().slice(0, 10),
+  loggedOnly: false,      // model filter: only runs with a vault experiment code
   resumeRun: null,        // run_id the sample resumes come from
   modelsLoaded: [],       // loaded run_ids
   // job title flow (Sankey)
@@ -210,7 +211,7 @@ const COMPARE_HIDDEN = new Set(['run_tag']);   // noise (usually N/A)
 function compareTableHtml(rids) {
   const runs = rids.map(r => state.runs[r]);
   const header = runs.map(r =>
-    `<th title="${r.run_id}">${r.run_name}<br><span class="hint">${r.architecture}${runDate(r) ? ' · ' + runDate(r) : ''}${r.loaded ? '' : ' · unavailable'}</span></th>`).join('');
+    `<th title="${r.run_id}">${r.experiment ? `<span class="exp-badge">${r.experiment}</span> ` : ''}${r.run_name}<br><span class="hint">${r.architecture}${runDate(r) ? ' · ' + runDate(r) : ''}${r.loaded ? '' : ' · unavailable'}</span></th>`).join('');
   const paramKeys = [...new Set(runs.flatMap(r => Object.keys(r.params)))]
     .filter(k => !COMPARE_HIDDEN.has(k)).sort();
   const row = (label, values, cls = '') => {
@@ -249,7 +250,8 @@ function renderModelSelect(keepOpen = false) {
   const cutoffMs = state.modelDateCutoff ? Date.parse(state.modelDateCutoff) : 0;
   const all = runsByDate();
   const ordered = all.filter(([, i]) =>
-    !cutoffMs || !+i.start_time || +i.start_time >= cutoffMs);
+    (!cutoffMs || !+i.start_time || +i.start_time >= cutoffMs)
+    && (!state.loggedOnly || i.experiment));
   const nHidden = all.length - ordered.length;
   const visibleIds = new Set(ordered.map(([rid]) => rid));
   const hiddenSelected = [...state.selectedModels]
@@ -260,14 +262,23 @@ function renderModelSelect(keepOpen = false) {
     <label>Trained after
       <input type="date" id="model-date-filter" value="${state.modelDateCutoff || ''}">
     </label>
+    <label title="Only show runs that have an experiment page in the docs vault
+           (Experiments/<code>.md) — matched on startup by run name / id">
+      <input type="checkbox" id="model-logged-filter" ${state.loggedOnly ? 'checked' : ''}>
+      logged experiments only
+    </label>
     <span class="hint">${nHidden
       ? `${nHidden} older run${nHidden > 1 ? 's' : ''} hidden — clear the date to show all`
       : 'showing all runs'}${hiddenSelected.length
       ? ` · <b>${hiddenSelected.length} selected model${hiddenSelected.length > 1 ? 's' : ''}
           hidden but still predicted</b> (${hiddenSelected.map(r => state.runs[r].run_name).join(', ')})`
       : ''}</span>`;
-  filter.querySelector('input').onchange = (e) => {
+  filter.querySelector('#model-date-filter').onchange = (e) => {
     state.modelDateCutoff = e.target.value;
+    renderModelSelect(true);
+  };
+  filter.querySelector('#model-logged-filter').onchange = (e) => {
+    state.loggedOnly = e.target.checked;
     renderModelSelect(true);
   };
   body.appendChild(filter);
@@ -281,16 +292,25 @@ function renderModelSelect(keepOpen = false) {
       <label for="${id}">
         <input type="checkbox" id="${id}" ${info.loaded ? '' : 'disabled'}
                ${state.selectedModels.has(rid) ? 'checked' : ''}>
+        ${info.experiment ? `<span class="exp-badge">${info.experiment}</span>` : ''}
         <b>${info.architecture}</b> · ${info.run_name}
         ${runDate(info) ? `<span class="run-date">${runDate(info)}</span>` : ''}
         ${info.metrics.test_recall_at_10 !== undefined
           ? `<span class="hint">R@10 ${info.metrics.test_recall_at_10.toFixed(3)}</span>` : ''}
         ${info.loaded ? '' : `<span class="warn" title="${info.error || ''}">unavailable — ${info.error || 'no model'}</span>`}
       </label>
+      ${info.loaded ? '<a class="model-internals" href="#" title="Whole-model view:\nattention profile, learned weights, drill-down">internals ↗</a>' : ''}
       <details class="model-info"><summary>info</summary>${modelInfoHtml(info)}</details>`;
     row.querySelector('input').onchange = (e) => {
       e.target.checked ? state.selectedModels.add(rid) : state.selectedModels.delete(rid);
       dd.querySelector('summary').textContent = modelSummaryText();
+    };
+    const internals = row.querySelector('.model-internals');
+    if (internals) internals.onclick = (e) => {
+      e.preventDefault();
+      const key = `cpt_model_${rid}`;
+      localStorage.setItem(key, JSON.stringify({ model: rid, label: info.label }));
+      window.open('/inspect#' + encodeURIComponent(key), '_blank');
     };
     body.appendChild(row);
   }
@@ -759,7 +779,7 @@ function renderPredictions() {
     const date = runDate(info);
     const r10 = info.metrics && info.metrics.test_recall_at_10 !== undefined
       ? `<span class="hint">R@10 ${info.metrics.test_recall_at_10.toFixed(3)}</span>` : '';
-    let html = `<h3>${name}
+    let html = `<h3>${info.experiment ? `<span class="exp-badge">${info.experiment}</span> ` : ''}${name}
       ${date ? `<span class="run-date">${date}</span>` : ''} ${r10}
       <span class="hint">(${scoreLabel}${nRanked})</span></h3>`;
     html += senseHtml(r, target);

@@ -45,6 +45,14 @@ def load_models():
     except Exception as e:
         traceback.print_exc()
         RUNS = {}
+    # Label runs with their experiment code from the docs vault (read-only) —
+    # e.g. R4, M1 — so models in the UI line up with the experiment logs.
+    try:
+        from demo.experiments import match_runs
+        n = match_runs(RUNS)
+        print(f'experiment logs: {n}/{len(RUNS)} staged runs matched to vault codes')
+    except Exception as e:
+        print(f'experiment-log scan skipped ({e})')
     for rid, r in RUNS.items():
         if r['model'] is not None:
             print(f"loaded {r['label']} ({rid[:8]}): {r['model'].vocab_size:,} tokens, "
@@ -117,6 +125,7 @@ def status():
             'transformations': registry.transformations(r['params']),
             'metrics': registry.key_metrics(r['metrics']),
             'start_time': r['start_time'],
+            'experiment': r.get('experiment'),
         }
         m = r['model']
         if m is not None:
@@ -299,20 +308,29 @@ def inspect_endpoint():   # named to avoid shadowing the stdlib `inspect` module
     """Drill-down for one (model, resume, title): bert4rec logit lens +
     per-layer/head attention matrices; item2vec per-token cosine pull."""
     payload = request.get_json(force=True)
-    tokens  = _resolve_tokens(payload)
-    if not tokens:
-        return jsonify({'error': 'No tokens provided'}), 400
     rid = payload.get('model', '')
-    title = payload.get('title')
-    if not title:
-        return jsonify({'error': 'No title provided'}), 400
     r = RUNS.get(rid)
     if r is None or r['model'] is None:
         return jsonify({'error': f'{rid} not loaded'}), 400
-    from demo.introspection import inspect_model
-    result = inspect_model(r['model'], r['architecture'], tokens, title)
+    title = payload.get('title')
+    if not title:
+        # Whole-model view: learned weights per layer/head plus the aggregate
+        # [MASK]-attention-by-token-type profile over held-out sample resumes.
+        contexts = []
+        if r['samples_path']:
+            with open(r['samples_path']) as f:
+                contexts = [s['context_tokens'] for s in json.load(f)[:12]]
+        from demo.introspection import inspect_model_static
+        result = inspect_model_static(r['model'], r['architecture'], contexts)
+    else:
+        tokens = _resolve_tokens(payload)
+        if not tokens:
+            return jsonify({'error': 'No tokens provided'}), 400
+        from demo.introspection import inspect_model
+        result = inspect_model(r['model'], r['architecture'], tokens, title)
     result['model'] = rid
     result['label'] = r['label']
+    result['experiment'] = r.get('experiment')
     return jsonify(result)
 
 

@@ -409,6 +409,125 @@ def inspect_bert4rec(m, tokens, title):
     }
 
 
+def inspect_model_static(m, architecture, sample_contexts=None):
+    """Whole-model view — no prediction needed. The learned, input-independent
+    internals: per-layer/head attention projections and FFN weights, plus an
+    aggregate attention profile (what token TYPE each head attends to from the
+    [MASK] query, averaged over held-out sample resumes) so a head's function
+    is visible without picking one resume."""
+    if architecture == 'item2vec':
+        return {'architecture': 'item2vec', 'static': True,
+                'vocab_size': m.vocab_size, 'vector_size': m.vector_size,
+                'note': 'item2vec has no layers or attention — one embedding '
+                        'table; drill into a prediction below to see per-token '
+                        'cosine pulls.'}
+    import torch
+    model = m.model
+    d_model = model.item_emb.weight.shape[1]
+    modern = hasattr(model, 'final_norm')
+    blocks = list(model.encoder) if modern else list(model.encoder.layers)
+    n_heads = int(blocks[0].n_heads if modern else blocks[0].self_attn.num_heads)
+
+    layers = []
+    for li, layer in enumerate(blocks, start=1):
+        ffn = ({'w1': layer.mlp_in.weight, 'w2': layer.mlp_out.weight} if modern
+               else {'w1': layer.linear1.weight, 'w2': layer.linear2.weight})
+        layers.append({
+            'name': f'encoder layer {li}',
+            'heads': _head_weights(layer, d_model, n_heads),
+            'ffn': {k: np.round(v.detach().numpy(), 3).tolist()
+                    for k, v in ffn.items()},
+        })
+
+    # Aggregate [MASK] attention by token type, averaged over sample resumes:
+    # rows = token types, one matrix per (layer, head). A slim attention-only
+    # forward (same maths as the per-resume inspector, no lens/ablation).
+    profile = None
+    if sample_contexts:
+        vocab = m.vocab
+        is_dense = hasattr(m, '_context_row')
+
+        def _attn_rows(context):
+            """(token types incl. [MASK], [layer][head] mask-row attention)."""
+            if is_dense:
+                seq, injection, used = m._context_row(context)[:3]
+            else:
+                used = [t for t in context if t in vocab.str2idx][-(m._max_len - 1):]
+                p = m._max_len - 1 - len(used)
+                seq = ([vocab.pad_id] * p + [vocab.str2idx[t] for t in used]
+                       + [vocab.mask_id])
+                injection = None
+            if not used:
+                return None, None
+            pad_n = m._max_len - 1 - len(used)
+            ids_t = torch.tensor(seq).unsqueeze(0)
+            with torch.no_grad():
+                if is_dense and injection is not None:
+                    model._unseen_stash = injection
+                try:
+                    emb = (model._input_embeddings(ids_t) if is_dense
+                           else model.item_emb(ids_t))
+                finally:
+                    if is_dense:
+                        model._unseen_stash = None
+                if modern:
+                    x = model.dropout(model.norm(emb))
+                    bias = model._attn_bias(ids_t, x.dtype)
+                else:
+                    pos = torch.arange(m._max_len)
+                    x = model.dropout(model.norm(emb + model.pos_emb(pos)))
+                    kpm = ids_t == vocab.pad_id
+                per_layer = []
+                for layer in blocks:
+                    if modern:
+                        x, w, *_ = _modern_layer_forward(layer, x, bias)
+                    else:
+                        x, w, *_ = _layer_forward(layer, x, kpm)
+                    per_layer.append(w[0, :, -1, pad_n:])   # [MASK] row per head
+            types = [t.split(':', 1)[0] for t in used] + ['MASK']
+            return types, per_layer
+
+        model.eval()
+        sums, counts = {}, {}
+        n_used = 0
+        for context in sample_contexts:
+            types, per_layer = _attn_rows(context)
+            if types is None:
+                continue
+            n_used += 1
+            for li, rows in enumerate(per_layer, start=1):
+                for h in range(n_heads):
+                    for typ, wgt in zip(types, rows[h].tolist()):
+                        key = (li, h, typ)
+                        sums[key] = sums.get(key, 0.0) + wgt
+                        counts[key] = counts.get(key, 0) + 1
+        if n_used:
+            types = sorted({k[2] for k in sums})
+            profile = {
+                'n_resumes': n_used,
+                'types': types,
+                # [layer][head][type] mean attention from the [MASK] query
+                'mean': [[[round(sums.get((li, h, t), 0.0) /
+                                 max(counts.get((li, h, t), 1), 1), 4)
+                           for t in types]
+                          for h in range(n_heads)]
+                         for li in range(1, len(blocks) + 1)],
+            }
+
+    return {
+        'architecture': architecture,
+        'backbone': 'modernbert' if modern else 'bert4rec',
+        'static': True,
+        'n_layers': len(blocks),
+        'n_heads': n_heads,
+        'd_model': int(d_model),
+        'vocab_size': m.vocab_size,
+        'title_count': len(m.title_vocab),
+        'layers': layers,
+        'type_attention': profile,
+    }
+
+
 # ── item2vec ─────────────────────────────────────────────────────────────────
 
 def inspect_item2vec(m, tokens, title):
